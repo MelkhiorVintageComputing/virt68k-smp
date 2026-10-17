@@ -17,11 +17,11 @@ all: $(ELFS)
 
 $(B):
 	mkdir -p $@
-$(B)/%.o: common/%.S common/lib.h | $(B)
+$(B)/%.o: common/%.S $(wildcard common/*.h) | $(B)
 	$(CC) $(CFLAGS) -c -o $@ $<
-$(B)/%.o: common/%.c common/lib.h | $(B)
+$(B)/%.o: common/%.c $(wildcard common/*.h) | $(B)
 	$(CC) $(CFLAGS) -c -o $@ $<
-$(B)/%.t.o: tests/%.c common/lib.h | $(B)
+$(B)/%.t.o: tests/%.c $(wildcard common/*.h) | $(B)
 	$(CC) $(CFLAGS) -c -o $@ $<
 $(B)/%.elf: $(B)/%.t.o $(COMMON) common/link.ld
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(COMMON) $< $(LIBS)
