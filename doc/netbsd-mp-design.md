@@ -113,3 +113,22 @@ The asm helpers in `m68k/include/asm.h` are `GETCURCPU(An)`, `GETCURLWP(An)` and
 | N4 | IPIs: xcall, ipi(9), resched/AST, halt | `cpuctl list`, parallel workload |
 | N5 | pmap locking + TLB shootdown | stress: parallel builds, ATF |
 | N6 | cleanup, LOCKDEBUG/DIAGNOSTIC soak | |
+
+## Status (2026-10-17)
+
+- GENERIC.MP boots multi-user with -smp 1, 2, 4 and 8 (MTTCG).
+- With 8 CPU-bound processes, the speedup is about 3.7× on 4 CPUs and 5.8× on 8.
+- ATF `/usr/tests/lib/libpthread` on 4 CPUs (stock 11.0 userland): 172 passed, 0 failed,
+  8 expected failures (known PRs), 1 skipped.
+- Bugs found and fixed on the way:
+  - **NetBSD**: the void `atomic_{add,sub,and,or,xor,inc,dec}_32` were plain RMW instructions,
+    which are not atomic across CPUs (they caused the 4-CPU boot hang via the TLB shootdown
+    ack counter). This also affects userland threads, so userland needs a rebuilt libc.
+  - **QEMU**: the M bit was not set on a write after a read, and the U/M updates were non-atomic
+    under MTTCG.
+- Known simplifications:
+  - Broadcast TLB shootdown on every invalidation.
+  - Kernel-lock pmap.
+  - Device interrupts on CPU 0 only.
+  - Modules are built without MULTIPROCESSOR (curlwp is unresolved), so they cannot be loaded
+    into GENERIC.MP.
