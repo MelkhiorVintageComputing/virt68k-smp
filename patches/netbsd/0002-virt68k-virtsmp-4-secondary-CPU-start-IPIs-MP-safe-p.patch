@@ -1,0 +1,1123 @@
+From 6657e4f78e3fc6efc50641ff7ccc4295f3dc3f0a Mon Sep 17 00:00:00 2001
+From: Romain Dolbeau <romain@dolbeau.org>
+Date: Sat, 17 Oct 2026 19:10:53 +0200
+Subject: [PATCH 2/3] virt68k: virtsmp(4), secondary CPU start, IPIs; MP-safe
+ pmap (steps N2-N5)
+
+- virtsmp(4) attaches from the BI_VIRT_SMP_BASE bootinfo record.  It
+  provides a timecounter (also without MULTIPROCESSOR, where it only
+  reports the CPUs).  With MULTIPROCESSOR it attaches the secondary
+  CPUs (cpu_info, private vector table, scratch stack, mi_cpu_attach),
+  starts them from cpu_boot_secondary_processors() through a locore
+  trampoline that enables the MMU like the boot CPU, delivers IPIs
+  (AST, xcall, ipi(9), halt, TLB shootdown) and drives hardclock() on
+  the secondary CPUs from their per-CPU timers.
+- pmap_motorola: one CADDR1/CADDR2 pair per CPU; with MULTIPROCESSOR,
+  the entry points take the kernel lock (kenter/kremove and the kernel
+  PT page lists a recursive spin lock), and TLB invalidations are
+  broadcast to the other CPUs by IPI.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ sys/arch/m68k/include/pmap_motorola.h     |   9 +
+ sys/arch/m68k/m68k/pmap_motorola.c        | 374 +++++++++++++++++++++-
+ sys/arch/virt68k/conf/GENERIC             |   1 +
+ sys/arch/virt68k/conf/files.virt68k       |   4 +
+ sys/arch/virt68k/dev/mainbus.c            |   8 +
+ sys/arch/virt68k/dev/virtsmp.c            | 307 ++++++++++++++++++
+ sys/arch/virt68k/dev/virtsmpreg.h         |  42 +++
+ sys/arch/virt68k/include/bootinfo.h       |   3 +
+ sys/arch/virt68k/virt68k/cpu_mp.c         |  11 +
+ sys/arch/virt68k/virt68k/cpu_mp.h         |  15 +
+ sys/arch/virt68k/virt68k/genassym.cf      |   4 +
+ sys/arch/virt68k/virt68k/locore.s         |  71 ++++
+ sys/arch/virt68k/virt68k/pmap_bootstrap.c |   4 +
+ 13 files changed, 838 insertions(+), 15 deletions(-)
+ create mode 100644 sys/arch/virt68k/dev/virtsmp.c
+ create mode 100644 sys/arch/virt68k/dev/virtsmpreg.h
+
+diff --git a/sys/arch/m68k/include/pmap_motorola.h b/sys/arch/m68k/include/pmap_motorola.h
+index 90ada6d11..6a4d9ae8b 100644
+--- a/sys/arch/m68k/include/pmap_motorola.h
++++ b/sys/arch/m68k/include/pmap_motorola.h
+@@ -78,11 +78,20 @@
+ 
+ #ifdef _KERNEL_OPT
+ #include "opt_m68k_arch.h"
++#include "opt_multiprocessor.h"
+ #endif
+ 
+ #include <machine/cpu.h>
+ #include <machine/pte.h>
+ 
++#if defined(_KERNEL) && defined(MULTIPROCESSOR)
++/* TLB shootdown (pmap_motorola.c); the port provides m68k_send_tlb_ipi() */
++#define	PMAP_TLB_ALL	((vaddr_t)-1)
++void	pmap_tlb_shootdown(vaddr_t);
++void	pmap_tlb_shootdown_ipi(void);
++void	m68k_send_tlb_ipi(struct cpu_info *);
++#endif
++
+ /*
+  * Pmap stuff
+  */
+diff --git a/sys/arch/m68k/m68k/pmap_motorola.c b/sys/arch/m68k/m68k/pmap_motorola.c
+index 7967c977a..cecddc33d 100644
+--- a/sys/arch/m68k/m68k/pmap_motorola.c
++++ b/sys/arch/m68k/m68k/pmap_motorola.c
+@@ -245,6 +245,179 @@ pt_entry_t	*Sysmap, *Sysptmap;
+ st_entry_t	*Segtabzero, *Segtabzeropa;
+ vsize_t		Sysptsize = VM_KERNEL_PT_PAGES;
+ 
++#ifdef MULTIPROCESSOR
++/*
++ * MULTIPROCESSOR support.  This pmap was written for one CPU and relies
++ * on splvm() for mutual exclusion; with several CPUs:
++ *
++ * - The public entry points take the kernel lock (it is recursive, and
++ *   released while the pmap sleeps in uvm_wait() & co, which gives the
++ *   same semantics as on a uniprocessor).  pmap_kenter_pa() and
++ *   pmap_kremove(), which may be called from interrupt handlers, and the
++ *   kernel PT page lists, use a recursive spin lock (pmap_klock) instead.
++ *   The *_unlocked functions are the original ones.
++ * - Every TLB invalidation is also done on the other running CPUs, by
++ *   an IPI (pmap_tlb_shootdown()), since active_pmap() cannot tell if a
++ *   pmap is in use on another CPU.  A full invalidation also makes the
++ *   other CPUs reload their user root pointer (the segment table of a
++ *   process may change while it runs threads on other CPUs).
++ *
++ * This favours correctness over speed.
++ */
++#include <sys/kcpuset.h>
++
++static inline void pmap_load_urp(paddr_t);
++static void	pmap_tbis_local(vaddr_t);
++static void	pmap_tbia_local(void);
++
++static void
++pmap_tbis_local(vaddr_t va)
++{
++	TBIS(va);
++}
++
++static void
++pmap_tbia_local(void)
++{
++	TBIA();
++}
++
++#undef	TBIS
++#undef	TBIA
++#undef	TBIAS
++#undef	TBIAU
++#define	TBIS(va)	do {						\
++		pmap_tbis_local(va);					\
++		pmap_tlb_shootdown(va);					\
++	} while (/*CONSTCOND*/0)
++#define	TBIA()		do {						\
++		pmap_tbia_local();					\
++		pmap_tlb_shootdown(PMAP_TLB_ALL);			\
++	} while (/*CONSTCOND*/0)
++#define	TBIAS()		TBIA()
++#define	TBIAU()		TBIA()
++#define	TBIS_LOCAL(va)	pmap_tbis_local(va)
++
++#define	pmap_remove		pmap_remove_unlocked
++#define	pmap_page_protect	pmap_page_protect_unlocked
++#define	pmap_protect		pmap_protect_unlocked
++#define	pmap_enter		pmap_enter_unlocked
++#define	pmap_kenter_pa		pmap_kenter_pa_unlocked
++#define	pmap_kremove		pmap_kremove_unlocked
++#define	pmap_unwire		pmap_unwire_unlocked
++#define	pmap_clear_modify	pmap_clear_modify_unlocked
++#define	pmap_clear_reference	pmap_clear_reference_unlocked
++#define	pmap_is_referenced	pmap_is_referenced_unlocked
++#define	pmap_is_modified	pmap_is_modified_unlocked
++#define	pmap_destroy		pmap_destroy_unlocked
++
++static void	pmap_remove(pmap_t, vaddr_t, vaddr_t);
++static void	pmap_page_protect(struct vm_page *, vm_prot_t);
++static void	pmap_protect(pmap_t, vaddr_t, vaddr_t, vm_prot_t);
++static int	pmap_enter(pmap_t, vaddr_t, paddr_t, vm_prot_t, u_int);
++static void	pmap_kenter_pa(vaddr_t, paddr_t, vm_prot_t, u_int);
++static void	pmap_kremove(vaddr_t, vsize_t);
++static void	pmap_unwire(pmap_t, vaddr_t);
++static bool	pmap_clear_modify(struct vm_page *);
++static bool	pmap_clear_reference(struct vm_page *);
++static bool	pmap_is_referenced(struct vm_page *);
++static bool	pmap_is_modified(struct vm_page *);
++static void	pmap_destroy(pmap_t);
++
++/* Recursive spin lock for the kernel PTEs and PT page lists. */
++static __cpu_simple_lock_t pmap_klock_lock = __SIMPLELOCK_UNLOCKED;
++static struct cpu_info * volatile pmap_klock_owner;
++static int pmap_klock_depth;
++
++static int
++pmap_klock(void)
++{
++	int s = splvm();
++	struct cpu_info *ci = curcpu();
++
++	if (pmap_klock_owner == ci) {
++		pmap_klock_depth++;
++	} else {
++		__cpu_simple_lock(&pmap_klock_lock);
++		pmap_klock_owner = ci;
++		pmap_klock_depth = 1;
++	}
++	return s;
++}
++
++static void
++pmap_kunlock(int s)
++{
++	KASSERT(pmap_klock_owner == curcpu());
++	if (--pmap_klock_depth == 0) {
++		pmap_klock_owner = NULL;
++		__cpu_simple_unlock(&pmap_klock_lock);
++	}
++	splx(s);
++}
++
++/* TLB shootdown mailbox */
++static __cpu_simple_lock_t pmap_tlb_lock = __SIMPLELOCK_UNLOCKED;
++static volatile vaddr_t pmap_tlb_va;
++static volatile u_int pmap_tlb_pending;
++
++void
++pmap_tlb_shootdown(vaddr_t va)
++{
++	CPU_INFO_ITERATOR cii;
++	struct cpu_info *ci, *self;
++	u_int n;
++	int s;
++
++	if (kcpuset_running == NULL || kcpuset_countset(kcpuset_running) < 2)
++		return;
++	/* The other CPUs must be able to interrupt us while we wait. */
++	s = splvm();
++	KASSERT((s & PSL_IPL) < PSL_IPL6);
++	while (!__cpu_simple_lock_try(&pmap_tlb_lock))
++		continue;
++	self = curcpu();
++	n = 0;
++	pmap_tlb_va = va;
++	for (CPU_INFO_FOREACH(cii, ci)) {
++		if (ci != self && kcpuset_isset(kcpuset_running, cpu_index(ci)))
++			n++;
++	}
++	pmap_tlb_pending = n;
++	for (CPU_INFO_FOREACH(cii, ci)) {
++		if (ci != self && kcpuset_isset(kcpuset_running, cpu_index(ci)))
++			m68k_send_tlb_ipi(ci);
++	}
++	while (pmap_tlb_pending != 0)
++		continue;
++	__cpu_simple_unlock(&pmap_tlb_lock);
++	splx(s);
++}
++
++/* IPI handler (IPL_SCHED) */
++void
++pmap_tlb_shootdown_ipi(void)
++{
++	vaddr_t va = pmap_tlb_va;
++
++	if (va == PMAP_TLB_ALL) {
++		struct lwp *l = curlwp;
++		pmap_t pm;
++
++		pmap_tbia_local();
++		if ((l->l_flag & LW_SYSTEM) == 0 && l->l_proc->p_vmspace) {
++			pm = vm_map_pmap(&l->l_proc->p_vmspace->vm_map);
++			pmap_load_urp((paddr_t)pm->pm_stpa);
++		}
++	} else {
++		pmap_tbis_local(va);
++	}
++	atomic_dec_uint(&pmap_tlb_pending);
++}
++#else
++#define	TBIS_LOCAL(va)	TBIS(va)
++#endif /* MULTIPROCESSOR */
++
+ static struct pmap kernel_pmap_store;
+ struct pmap	*const kernel_pmap_ptr = &kernel_pmap_store;
+ struct vm_map	*st_map, *pt_map;
+@@ -289,6 +462,24 @@ u_int		protostfree;	/* prototype (default) free ST map */
+ pt_entry_t	*caddr1_pte;	/* PTE for CADDR1 */
+ pt_entry_t	*caddr2_pte;	/* PTE for CADDR2 */
+ 
++#ifdef MULTIPROCESSOR
++/*
++ * Each CPU has its own pair of zero/copy windows: CPU n uses the pages
++ * at CADDR1 + 2n and CADDR1 + 2n + 1 (CADDR2 is CADDR1 + 1 page), so the
++ * TBIS() of the local CPU is enough.
++ */
++#define	PMAP_CADDR_OFF()	(2 * cpu_index(curcpu()))
++#define	PMAP_CADDR1()	((vaddr_t)CADDR1 + PMAP_CADDR_OFF() * PAGE_SIZE)
++#define	PMAP_CADDR2()	((vaddr_t)CADDR2 + PMAP_CADDR_OFF() * PAGE_SIZE)
++#define	PMAP_CADDR1_PTE() (caddr1_pte + PMAP_CADDR_OFF())
++#define	PMAP_CADDR2_PTE() (caddr2_pte + PMAP_CADDR_OFF())
++#else
++#define	PMAP_CADDR1()		((vaddr_t)CADDR1)
++#define	PMAP_CADDR2()		((vaddr_t)CADDR2)
++#define	PMAP_CADDR1_PTE()	caddr1_pte
++#define	PMAP_CADDR2_PTE()	caddr2_pte
++#endif
++
+ struct pool	pmap_pmap_pool;	/* memory pool for pmap structures */
+ struct pool	pmap_pv_pool;	/* memory pool for pv entries */
+ 
+@@ -330,8 +521,13 @@ void pmap_check_wiring(const char *, vaddr_t);
+ #define	PRM_CFLUSH	0x02
+ #define	PRM_KEEPPTPAGE	0x04
+ 
++#ifdef MULTIPROCESSOR
++/* may be active on another CPU: always flush (see above) */
++#define	active_pmap(pm)	(__USE(pm), 1)
++#else
+ #define	active_pmap(pm) \
+ 	((pm) == pmap_kernel() || (pm) == curproc->p_vmspace->vm_map.pmap)
++#endif
+ 
+ #define	active_user_pmap(pm) \
+ 	(curproc && \
+@@ -1488,7 +1684,7 @@ pmap_kenter_pa(vaddr_t va, paddr_t pa, vm_prot_t prot, u_int flags)
+ #endif
+ 
+ 	*pte = npte;
+-	TBIS(va);
++	TBIS_LOCAL(va);		/* the PTE was invalid: nothing to shoot down */
+ }
+ 
+ void
+@@ -1880,14 +2076,17 @@ pmap_zero_page(paddr_t phys)
+ 	}
+ #endif
+ 
+-	*caddr1_pte = npte;
+-	TBIS((vaddr_t)CADDR1);
++	vaddr_t va1 = PMAP_CADDR1();
++	pt_entry_t *pte1 = PMAP_CADDR1_PTE();
++
++	*pte1 = npte;
++	TBIS_LOCAL(va1);
+ 
+-	zeropage(CADDR1);
++	zeropage((void *)va1);
+ 
+ #ifdef DEBUG
+-	*caddr1_pte = PG_NV;
+-	TBIS((vaddr_t)CADDR1);
++	*pte1 = PG_NV;
++	TBIS_LOCAL(va1);
+ #endif
+ }
+ 
+@@ -1940,20 +2139,23 @@ pmap_copy_page(paddr_t src, paddr_t dst)
+ 	}
+ #endif
+ 
+-	*caddr1_pte = npte1;
+-	TBIS((vaddr_t)CADDR1);
++	vaddr_t va1 = PMAP_CADDR1(), va2 = PMAP_CADDR2();
++	pt_entry_t *pte1 = PMAP_CADDR1_PTE(), *pte2 = PMAP_CADDR2_PTE();
+ 
+-	*caddr2_pte = npte2;
+-	TBIS((vaddr_t)CADDR2);
++	*pte1 = npte1;
++	TBIS_LOCAL(va1);
+ 
+-	copypage(CADDR1, CADDR2);
++	*pte2 = npte2;
++	TBIS_LOCAL(va2);
++
++	copypage((void *)va1, (void *)va2);
+ 
+ #ifdef DEBUG
+-	*caddr1_pte = PG_NV;
+-	TBIS((vaddr_t)CADDR1);
++	*pte1 = PG_NV;
++	TBIS_LOCAL(va1);
+ 
+-	*caddr2_pte = PG_NV;
+-	TBIS((vaddr_t)CADDR2);
++	*pte2 = PG_NV;
++	TBIS_LOCAL(va2);
+ #endif
+ }
+ 
+@@ -2627,7 +2829,11 @@ pmap_enter_ptpage(pmap_t pmap, vaddr_t va, bool can_fail)
+ 	if (pmap == pmap_kernel()) {
+ 		struct kpt_page *kpt;
+ 
++#ifdef MULTIPROCESSOR
++		s = pmap_klock();
++#else
+ 		s = splvm();
++#endif
+ 		if ((kpt = kpt_free_list) == NULL) {
+ 			/*
+ 			 * No PT pages available.
+@@ -2655,7 +2861,11 @@ pmap_enter_ptpage(pmap_t pmap, vaddr_t va, bool can_fail)
+ 			    ix, Sysptmap[ix], kpt->kpt_va);
+ 		}
+ #endif
++#ifdef MULTIPROCESSOR
++		pmap_kunlock(s);
++#else
+ 		splx(s);
++#endif
+ 	} else {
+ 
+ 		/*
+@@ -2996,3 +3206,137 @@ kvtop(void *addr)
+ {
+ 	return (int)vtophys((vaddr_t)addr);
+ }
++
++#ifdef MULTIPROCESSOR
++/*
++ * Locked entry points (see the comment at the top of this file).
++ */
++#undef	pmap_remove
++#undef	pmap_page_protect
++#undef	pmap_protect
++#undef	pmap_enter
++#undef	pmap_kenter_pa
++#undef	pmap_kremove
++#undef	pmap_unwire
++#undef	pmap_clear_modify
++#undef	pmap_clear_reference
++#undef	pmap_is_referenced
++#undef	pmap_is_modified
++#undef	pmap_destroy
++
++#define	PMAP_KLOCK_BEGIN	KERNEL_LOCK(1, NULL)
++#define	PMAP_KLOCK_END		KERNEL_UNLOCK_ONE(NULL)
++
++void
++pmap_remove(pmap_t pmap, vaddr_t sva, vaddr_t eva)
++{
++	PMAP_KLOCK_BEGIN;
++	pmap_remove_unlocked(pmap, sva, eva);
++	PMAP_KLOCK_END;
++}
++
++void
++pmap_page_protect(struct vm_page *pg, vm_prot_t prot)
++{
++	PMAP_KLOCK_BEGIN;
++	pmap_page_protect_unlocked(pg, prot);
++	PMAP_KLOCK_END;
++}
++
++void
++pmap_protect(pmap_t pmap, vaddr_t sva, vaddr_t eva, vm_prot_t prot)
++{
++	PMAP_KLOCK_BEGIN;
++	pmap_protect_unlocked(pmap, sva, eva, prot);
++	PMAP_KLOCK_END;
++}
++
++int
++pmap_enter(pmap_t pmap, vaddr_t va, paddr_t pa, vm_prot_t prot, u_int flags)
++{
++	int error;
++
++	PMAP_KLOCK_BEGIN;
++	error = pmap_enter_unlocked(pmap, va, pa, prot, flags);
++	PMAP_KLOCK_END;
++	return error;
++}
++
++void
++pmap_kenter_pa(vaddr_t va, paddr_t pa, vm_prot_t prot, u_int flags)
++{
++	int s = pmap_klock();
++
++	pmap_kenter_pa_unlocked(va, pa, prot, flags);
++	pmap_kunlock(s);
++}
++
++void
++pmap_kremove(vaddr_t va, vsize_t size)
++{
++	int s = pmap_klock();
++
++	pmap_kremove_unlocked(va, size);
++	pmap_kunlock(s);
++}
++
++void
++pmap_unwire(pmap_t pmap, vaddr_t va)
++{
++	PMAP_KLOCK_BEGIN;
++	pmap_unwire_unlocked(pmap, va);
++	PMAP_KLOCK_END;
++}
++
++bool
++pmap_clear_modify(struct vm_page *pg)
++{
++	bool rv;
++
++	PMAP_KLOCK_BEGIN;
++	rv = pmap_clear_modify_unlocked(pg);
++	PMAP_KLOCK_END;
++	return rv;
++}
++
++bool
++pmap_clear_reference(struct vm_page *pg)
++{
++	bool rv;
++
++	PMAP_KLOCK_BEGIN;
++	rv = pmap_clear_reference_unlocked(pg);
++	PMAP_KLOCK_END;
++	return rv;
++}
++
++bool
++pmap_is_referenced(struct vm_page *pg)
++{
++	bool rv;
++
++	PMAP_KLOCK_BEGIN;
++	rv = pmap_is_referenced_unlocked(pg);
++	PMAP_KLOCK_END;
++	return rv;
++}
++
++bool
++pmap_is_modified(struct vm_page *pg)
++{
++	bool rv;
++
++	PMAP_KLOCK_BEGIN;
++	rv = pmap_is_modified_unlocked(pg);
++	PMAP_KLOCK_END;
++	return rv;
++}
++
++void
++pmap_destroy(pmap_t pmap)
++{
++	PMAP_KLOCK_BEGIN;
++	pmap_destroy_unlocked(pmap);
++	PMAP_KLOCK_END;
++}
++#endif /* MULTIPROCESSOR */
+diff --git a/sys/arch/virt68k/conf/GENERIC b/sys/arch/virt68k/conf/GENERIC
+index c8426f78d..29f257136 100644
+--- a/sys/arch/virt68k/conf/GENERIC
++++ b/sys/arch/virt68k/conf/GENERIC
+@@ -171,6 +171,7 @@ gfrtc*		at mainbus? addr ?	# real-time clock / timer
+ 
+ # Qemu Virtual System Controller
+ virtctrl*	at mainbus? addr ?
++virtsmp*	at mainbus? addr ?	# SMP controller (-smp N)
+ 
+ # VirtIO devices
+ virtio*		at mainbus? addr ?	# VirtIO nexus
+diff --git a/sys/arch/virt68k/conf/files.virt68k b/sys/arch/virt68k/conf/files.virt68k
+index 55d5d6bf3..a03305700 100644
+--- a/sys/arch/virt68k/conf/files.virt68k
++++ b/sys/arch/virt68k/conf/files.virt68k
+@@ -28,6 +28,10 @@ device virtctrl
+ attach virtctrl at mainbus
+ file arch/virt68k/dev/virtctrl.c		virtctrl
+ 
++device virtsmp
++attach virtsmp at mainbus
++file arch/virt68k/dev/virtsmp.c		virtsmp
++
+ # Memory disk for installer
+ file dev/md_root.c				memory_disk_hooks
+ 
+diff --git a/sys/arch/virt68k/dev/mainbus.c b/sys/arch/virt68k/dev/mainbus.c
+index 64e011165..a6116e7f7 100644
+--- a/sys/arch/virt68k/dev/mainbus.c
++++ b/sys/arch/virt68k/dev/mainbus.c
+@@ -223,6 +223,14 @@ mainbus_attach_other(struct bi_record *bi, void *v)
+ 		}
+ 		break;
+ 
++	case BI_VIRT_SMP_BASE:
++		ma.ma_compatible = "netbsd,qemu-virt-smp";	/* XXX */
++		ma.ma_addr = vd->vd_mmio_base;
++		ma.ma_size = 0x1000;
++		ma.ma_irq  = -1;	/* vd_irq_base is the number of CPUs */
++		config_found(self, &ma, mainbus_print, CFARGS_NONE);
++		break;
++
+ 	case BI_VIRT_CTRL_BASE:
+ 		ma.ma_compatible = "netbsd,qemu-virt-ctrl";	/* XXX */
+ 		ma.ma_addr = vd->vd_mmio_base;
+diff --git a/sys/arch/virt68k/dev/virtsmp.c b/sys/arch/virt68k/dev/virtsmp.c
+new file mode 100644
+index 000000000..be1f3dca5
+--- /dev/null
++++ b/sys/arch/virt68k/dev/virtsmp.c
+@@ -0,0 +1,307 @@
++/*	$NetBSD$	*/
++
++/*-
++ * Copyright (c) 2026 The NetBSD Foundation, Inc.
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE NETBSD FOUNDATION, INC. AND CONTRIBUTORS
++ * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
++ * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
++ * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE FOUNDATION OR CONTRIBUTORS
++ * BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++ * POSSIBILITY OF SUCH DAMAGE.
++ */
++
++/*
++ * Driver for the QEMU m68k virt machine SMP controller ("virt-smp",
++ * see QEMU's docs/specs/virt-smp.rst).
++ *
++ * Always: a timecounter on the controller's nanosecond counter.
++ * With MULTIPROCESSOR: attachment and start of the secondary CPUs,
++ * inter-processor interrupts, and the hardclock of the secondary CPUs
++ * from their per-CPU timers.  Device interrupts stay on the boot CPU.
++ */
++
++#include <sys/cdefs.h>
++__KERNEL_RCSID(0, "$NetBSD$");
++
++#include "opt_multiprocessor.h"
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/atomic.h>
++#include <sys/bus.h>
++#include <sys/cpu.h>
++#include <sys/device.h>
++#include <sys/idle.h>
++#include <sys/kernel.h>
++#include <sys/kmem.h>
++#include <sys/lwp.h>
++#include <sys/timetc.h>
++
++#include <uvm/uvm_extern.h>
++
++#include <machine/cpu.h>
++#include <machine/pcb.h>
++#include <machine/vectors.h>
++
++#include <virt68k/dev/mainbusvar.h>
++#include <virt68k/dev/virtsmpreg.h>
++#include <virt68k/virt68k/cpu_mp.h>
++
++struct virtsmp_softc {
++	device_t		sc_dev;
++	bus_space_tag_t		sc_bst;
++	bus_space_handle_t	sc_bsh;
++	u_int			sc_ncpus;
++	struct timecounter	sc_tc;
++};
++
++static struct virtsmp_softc *virtsmp_sc;
++
++static const struct device_compatible_entry compat_data[] = {
++	{ .compat = "netbsd,qemu-virt-smp" },
++	DEVICE_COMPAT_EOL
++};
++
++#define	REG_READ(sc, r)		\
++	bus_space_read_4((sc)->sc_bst, (sc)->sc_bsh, (r))
++#define	REG_WRITE(sc, r, v)	\
++	bus_space_write_4((sc)->sc_bst, (sc)->sc_bsh, (r), (v))
++
++static u_int
++virtsmp_get_timecount(struct timecounter *tc)
++{
++	struct virtsmp_softc * const sc = tc->tc_priv;
++
++	return REG_READ(sc, VIRTSMP_COUNTER_LO);
++}
++
++#ifdef MULTIPROCESSOR
++/* Assembly glue in locore.s */
++extern char intrhand_virtsmp_ipi[], intrhand_virtsmp_timer[];
++extern char cpu_spinup_trampoline[];
++
++/*
++ * Read by cpu_spinup_trampoline (MMU off, so in the kernel image, which
++ * is mapped VA == PA).
++ */
++struct virt68k_hatch virt68k_hatch[MAXCPUS];
++static volatile u_int virtsmp_hatched;
++
++static void
++virtsmp_ipi_send(struct cpu_info *ci, u_int ipi)
++{
++	struct virtsmp_softc * const sc = virtsmp_sc;
++
++	REG_WRITE(sc, VIRTSMP_IPI_SEND,
++	    (1u << (VIRTSMP_IPI_REASON_SHIFT + ipi)) | (1u << ci->ci_cpuid));
++}
++
++/* IPI interrupt, at IPL_SCHED, from intrhand_virtsmp_ipi. */
++void	virtsmp_ipi_intr(void);
++void
++virtsmp_ipi_intr(void)
++{
++	struct virtsmp_softc * const sc = virtsmp_sc;
++	uint32_t pending;
++
++	pending = REG_READ(sc, VIRTSMP_IPI_PENDING);
++	REG_WRITE(sc, VIRTSMP_IPI_CLEAR, pending);
++	curcpu()->ci_data.cpu_nintr++;
++	virt68k_ipi_dispatch(pending);
++}
++
++/* Per-CPU timer interrupt, at IPL_SCHED, from intrhand_virtsmp_timer. */
++void	virtsmp_clock_intr(struct clockframe);
++void
++virtsmp_clock_intr(struct clockframe frame)
++{
++	struct virtsmp_softc * const sc = virtsmp_sc;
++
++	REG_WRITE(sc, VIRTSMP_TIMER_STATUS, VIRTSMP_TIMER_EXPIRED);
++	curcpu()->ci_data.cpu_nintr++;
++	hardclock(&frame);
++}
++
++static void
++virtsmp_start_clock(struct virtsmp_softc *sc)
++{
++	REG_WRITE(sc, VIRTSMP_TIMER_INTERVAL, 1000000000u / hz);
++	REG_WRITE(sc, VIRTSMP_TIMER_CTRL,
++	    VIRTSMP_TIMER_ENABLE | VIRTSMP_TIMER_PERIODIC);
++}
++
++/*
++ * First C code run by a secondary CPU, on the stack of its idle lwp,
++ * with the MMU on and its VBR loaded.  Does not return.
++ */
++void	cpu_hatch(struct cpu_info *);
++void
++cpu_hatch(struct cpu_info *ci)
++{
++	struct lwp *l = ci->ci_data.cpu_idlelwp;
++
++	KASSERT(curcpu() == ci);
++	ci->ci_curlwp = l;
++	ci->ci_curpcb = lwp_getpcb(l);
++
++	virtsmp_start_clock(virtsmp_sc);
++
++	atomic_inc_uint(&virtsmp_hatched);
++	idle_loop(NULL);
++	/* NOTREACHED */
++}
++
++static void
++virtsmp_boot_secondaries(void)
++{
++	struct virtsmp_softc * const sc = virtsmp_sc;
++	CPU_INFO_ITERATOR cii;
++	struct cpu_info *ci;
++	u_int started = 0;
++
++	for (CPU_INFO_FOREACH(cii, ci)) {
++		struct virt68k_hatch *h;
++		struct lwp *l;
++		int n = ci->ci_cpuid, i;
++
++		if (CPU_IS_PRIMARY(ci))
++			continue;
++		l = ci->ci_data.cpu_idlelwp;
++		h = &virt68k_hatch[n];
++		h->h_ci = ci;
++		h->h_sp = (char *)uvm_lwp_getuarea(l) + USPACE - 4;
++		h->h_vbr = ci->ci_vectors;
++		REG_WRITE(sc, VIRTSMP_CPU(n) + VIRTSMP_START_PC,
++		    (uint32_t)cpu_spinup_trampoline);
++		REG_WRITE(sc, VIRTSMP_CPU(n) + VIRTSMP_START_SP,
++		    (uint32_t)&h->h_stack[__arraycount(h->h_stack)]);
++		REG_WRITE(sc, VIRTSMP_CPU(n) + VIRTSMP_START_ARG, (uint32_t)h);
++		REG_WRITE(sc, VIRTSMP_CPU(n) + VIRTSMP_CPU_CTRL, 1);
++		started++;
++		for (i = 0; i < 1000000 && virtsmp_hatched < started; i++)
++			delay(10);
++		if (virtsmp_hatched < started) {
++			aprint_error("%s: cpu%d did not start\n",
++			    device_xname(sc->sc_dev), n);
++			started--;
++		}
++	}
++	aprint_normal("%s: %u secondary CPUs started\n",
++	    device_xname(sc->sc_dev), started);
++}
++
++static void
++virtsmp_attach_cpu(struct virtsmp_softc *sc, u_int n)
++{
++	struct cpu_info *ci, *t;
++	void **vectors;
++	char *stk;
++	int error;
++
++	ci = kmem_zalloc(sizeof(*ci), KM_SLEEP);
++	vectors = kmem_alloc(VECTAB_SIZE * sizeof(void *), KM_SLEEP);
++	memcpy(vectors, vectab, NVECTORS * sizeof(void *));
++	vectors[NVECTORS] = ci;
++	stk = kmem_alloc(VIRT68K_TMPSTK_SIZE, KM_SLEEP);
++
++	ci->ci_self = ci;
++	ci->ci_cpuid = n;
++	ci->ci_vectors = vectors;
++	ci->ci_tmpstk = stk + VIRT68K_TMPSTK_SIZE;
++
++	error = mi_cpu_attach(ci);
++	if (error != 0) {
++		aprint_error_dev(sc->sc_dev, "cannot attach cpu%u: %d\n",
++		    n, error);
++		return;
++	}
++	/* append to the CPU list, which vec_set_entry() walks */
++	for (t = cpu_info_list; t->ci_next != NULL; t = t->ci_next)
++		continue;
++	t->ci_next = ci;
++}
++#endif /* MULTIPROCESSOR */
++
++static int
++virtsmp_match(device_t parent, cfdata_t cf, void *aux)
++{
++	struct mainbus_attach_args * const ma = aux;
++
++	return mainbus_compatible_match(ma, compat_data);
++}
++
++static void
++virtsmp_attach(device_t parent, device_t self, void *aux)
++{
++	struct virtsmp_softc * const sc = device_private(self);
++	struct mainbus_attach_args * const ma = aux;
++	uint32_t vers;
++
++	sc->sc_dev = self;
++	sc->sc_bst = ma->ma_st;
++	if (bus_space_map(sc->sc_bst, ma->ma_addr, ma->ma_size, 0,
++			  &sc->sc_bsh) != 0) {
++		aprint_error(": couldn't map registers\n");
++		return;
++	}
++	vers = REG_READ(sc, VIRTSMP_VERSION);
++	sc->sc_ncpus = REG_READ(sc, VIRTSMP_NCPUS);
++
++	aprint_naive("\n");
++	aprint_normal(": Qemu Virtual SMP Controller v%u, %u CPUs\n",
++	    vers, sc->sc_ncpus);
++	virtsmp_sc = sc;
++
++	sc->sc_tc.tc_get_timecount = virtsmp_get_timecount;
++	sc->sc_tc.tc_counter_mask = ~0u;
++	sc->sc_tc.tc_frequency = 1000000000;
++	sc->sc_tc.tc_name = device_xname(self);
++	sc->sc_tc.tc_quality = 100;
++	sc->sc_tc.tc_priv = sc;
++	tc_init(&sc->sc_tc);
++
++#ifdef MULTIPROCESSOR
++	u_int n;
++
++	if (REG_READ(sc, VIRTSMP_ID) != 0) {
++		aprint_error_dev(self, "not running on cpu0\n");
++		return;
++	}
++	if (sc->sc_ncpus > MAXCPUS) {
++		aprint_error_dev(self, "only %d CPUs supported\n", MAXCPUS);
++		sc->sc_ncpus = MAXCPUS;
++	}
++	/* before the vector tables of the other CPUs are copied */
++	vec_set_entry(VIRTSMP_IPI_VECTOR, intrhand_virtsmp_ipi);
++	vec_set_entry(VIRTSMP_TIMER_VECTOR, intrhand_virtsmp_timer);
++
++	for (n = 1; n < sc->sc_ncpus; n++)
++		virtsmp_attach_cpu(sc, n);
++
++	virt68k_ipi_send = virtsmp_ipi_send;
++	virt68k_boot_secondaries = virtsmp_boot_secondaries;
++#else
++	if (sc->sc_ncpus > 1)
++		aprint_normal_dev(self,
++		    "options MULTIPROCESSOR not configured, using 1 CPU\n");
++#endif
++}
++
++CFATTACH_DECL_NEW(virtsmp, sizeof(struct virtsmp_softc),
++	virtsmp_match, virtsmp_attach, NULL, NULL);
+diff --git a/sys/arch/virt68k/dev/virtsmpreg.h b/sys/arch/virt68k/dev/virtsmpreg.h
+new file mode 100644
+index 000000000..35a691b20
+--- /dev/null
++++ b/sys/arch/virt68k/dev/virtsmpreg.h
+@@ -0,0 +1,42 @@
++/*	$NetBSD$	*/
++
++/*
++ * QEMU m68k virt machine SMP controller registers
++ * (QEMU docs/specs/virt-smp.rst).  Same license as virtsmp.c.
++ */
++
++#ifndef _VIRT68K_VIRTSMPREG_H_
++#define _VIRT68K_VIRTSMPREG_H_
++
++/* banked: registers of the accessing CPU */
++#define	VIRTSMP_ID		0x000
++#define	VIRTSMP_NCPUS		0x004
++#define	VIRTSMP_VERSION		0x008
++#define	VIRTSMP_IPI_PENDING	0x010
++#define	VIRTSMP_IPI_CLEAR	0x014
++#define	VIRTSMP_IPI_CONFIG	0x018
++#define	VIRTSMP_TIMER_CTRL	0x020
++#define	VIRTSMP_TIMER_ENABLE	__BIT(0)
++#define	VIRTSMP_TIMER_PERIODIC	__BIT(1)
++#define	VIRTSMP_TIMER_INTERVAL	0x024
++#define	VIRTSMP_TIMER_STATUS	0x028
++#define	VIRTSMP_TIMER_EXPIRED	__BIT(0)
++#define	VIRTSMP_TIMER_CONFIG	0x02c
++
++/* global */
++#define	VIRTSMP_IPI_SEND	0x100
++#define	VIRTSMP_IPI_REASON_SHIFT 16
++#define	VIRTSMP_DEVIRQ_ROUTE	0x110
++#define	VIRTSMP_COUNTER_LO	0x120
++#define	VIRTSMP_COUNTER_HI	0x124
++#define	VIRTSMP_CPU(n)		(0x200 + 16 * (n))
++#define	VIRTSMP_START_PC	0x0
++#define	VIRTSMP_START_SP	0x4
++#define	VIRTSMP_START_ARG	0x8
++#define	VIRTSMP_CPU_CTRL	0xc
++
++/* reset values of IPI_CONFIG and TIMER_CONFIG (both at IPL 6) */
++#define	VIRTSMP_IPI_VECTOR	0x40
++#define	VIRTSMP_TIMER_VECTOR	0x41
++
++#endif /* _VIRT68K_VIRTSMPREG_H_ */
+diff --git a/sys/arch/virt68k/include/bootinfo.h b/sys/arch/virt68k/include/bootinfo.h
+index b7f9f91db..0eb82b1a2 100644
+--- a/sys/arch/virt68k/include/bootinfo.h
++++ b/sys/arch/virt68k/include/bootinfo.h
+@@ -68,6 +68,9 @@ struct bi_record {
+ #define	BI_VIRT_GF_TTY_BASE	BI_MACHDEP(3)
+ #define	BI_VIRT_VIRTIO_BASE	BI_MACHDEP(4)
+ #define	BI_VIRT_CTRL_BASE	BI_MACHDEP(5)
++					/* 6: was BI_VIRT_RNG_SEED */
++#define	BI_VIRT_SMP_BASE	BI_MACHDEP(7)	/* bi_virt_dev, but the
++						   2nd word is the # of CPUs */
+ 
+ struct bi_mem_info {
+ 	uint32_t	mem_addr;	/* PA of memory segment */
+diff --git a/sys/arch/virt68k/virt68k/cpu_mp.c b/sys/arch/virt68k/virt68k/cpu_mp.c
+index 0bf906d22..1e2f44ddc 100644
+--- a/sys/arch/virt68k/virt68k/cpu_mp.c
++++ b/sys/arch/virt68k/virt68k/cpu_mp.c
+@@ -43,8 +43,11 @@ __KERNEL_RCSID(0, "$NetBSD$");
+ #include <sys/lwp.h>
+ #include <sys/xcall.h>
+ 
++#include <uvm/uvm_extern.h>
++
+ #include <machine/cpu.h>
+ #include <machine/intr.h>
++#include <machine/pmap.h>
+ 
+ #include <virt68k/virt68k/cpu_mp.h>
+ 
+@@ -59,6 +62,12 @@ cpu_send_ipi(struct cpu_info *ci, u_int ipi)
+ 		(*virt68k_ipi_send)(ci, ipi);
+ }
+ 
++void
++m68k_send_tlb_ipi(struct cpu_info *ci)
++{
++	cpu_send_ipi(ci, VIRT68K_IPI_TLB);
++}
++
+ void
+ cpu_set_ast(struct lwp *l)
+ {
+@@ -117,6 +126,8 @@ cpu_ipi(struct cpu_info *ci)
+ void
+ virt68k_ipi_dispatch(u_int pending)
+ {
++	if (pending & (1u << VIRT68K_IPI_TLB))
++		pmap_tlb_shootdown_ipi();
+ 	if (pending & (1u << VIRT68K_IPI_AST)) {
+ 		/* curcpu()->ci_astpending was set by the sender */
+ 	}
+diff --git a/sys/arch/virt68k/virt68k/cpu_mp.h b/sys/arch/virt68k/virt68k/cpu_mp.h
+index 7990bd732..a0df34a5b 100644
+--- a/sys/arch/virt68k/virt68k/cpu_mp.h
++++ b/sys/arch/virt68k/virt68k/cpu_mp.h
+@@ -16,9 +16,24 @@
+ #define	VIRT68K_IPI_GENERIC	3
+ #define	VIRT68K_IPI_HALT	4
+ #define	VIRT68K_IPI_DDB		5
++#define	VIRT68K_IPI_TLB		6	/* pmap_tlb_shootdown() */
+ 
+ struct cpu_info;
+ 
++/* Size of the per-CPU scratch stack used by cpu_switchto() */
++#define	VIRT68K_TMPSTK_SIZE	1024
++
++/*
++ * Passed to cpu_spinup_trampoline (locore.s) in START_ARG; the offsets
++ * are used there (HATCH_*).
++ */
++struct virt68k_hatch {
++	struct cpu_info	*h_ci;		/* HATCH_CI */
++	void		*h_sp;		/* HATCH_SP: idle lwp stack */
++	void		*h_vbr;		/* HATCH_VBR */
++	uint32_t	h_stack[64];	/* stack while the MMU is off */
++};
++
+ extern void	(*virt68k_ipi_send)(struct cpu_info *, u_int);
+ extern void	(*virt68k_boot_secondaries)(void);
+ void	virt68k_ipi_dispatch(u_int);
+diff --git a/sys/arch/virt68k/virt68k/genassym.cf b/sys/arch/virt68k/virt68k/genassym.cf
+index 4351a234d..c0a7ee97e 100644
+--- a/sys/arch/virt68k/virt68k/genassym.cf
++++ b/sys/arch/virt68k/virt68k/genassym.cf
+@@ -42,6 +42,7 @@ include <sys/syscall.h>
+ include <uvm/uvm_extern.h>
+ 
+ include <machine/cpu.h>
++include <virt68k/virt68k/cpu_mp.h>
+ include <machine/fcode.h>
+ include <machine/psl.h>
+ include <machine/pcb.h>
+@@ -108,6 +109,9 @@ define	CI_CURPCB		offsetof(struct cpu_info, ci_curpcb)
+ define	CI_ASTPENDING		offsetof(struct cpu_info, ci_astpending)
+ define	CI_TMPSTK		offsetof(struct cpu_info, ci_tmpstk)
+ define	VB_CI			offsetof(struct m68k_vecblk, vb_ci)
++define	HATCH_CI		offsetof(struct virt68k_hatch, h_ci)
++define	HATCH_SP		offsetof(struct virt68k_hatch, h_sp)
++define	HATCH_VBR		offsetof(struct virt68k_hatch, h_vbr)
+ endif
+ 
+ # PSL values (should just include psl.h?)
+diff --git a/sys/arch/virt68k/virt68k/locore.s b/sys/arch/virt68k/virt68k/locore.s
+index d6aff70be..511eb7ac9 100644
+--- a/sys/arch/virt68k/virt68k/locore.s
++++ b/sys/arch/virt68k/virt68k/locore.s
+@@ -589,6 +589,77 @@ Laststkadj:
+ 	movl	%sp@,%sp		| and our SP
+ 	rte				| and do real RTE
+ 
++#ifdef MULTIPROCESSOR
++/*
++ * Interrupts from virtsmp(4): IPIs and the per-CPU timer (IPL 6).
++ */
++ENTRY_NOPROFILE(intrhand_virtsmp_ipi)
++	INTERRUPT_SAVEREG
++	GETCURCPU(%a0)
++	addql	#1,%a0@(CI_IDEPTH)
++	jbsr	_C_LABEL(virtsmp_ipi_intr)
++	GETCURCPU(%a0)
++	subql	#1,%a0@(CI_IDEPTH)
++	INTERRUPT_RESTOREREG
++	jra	_ASM_LABEL(rei)
++
++ENTRY_NOPROFILE(intrhand_virtsmp_timer)
++	INTERRUPT_SAVEREG
++	GETCURCPU(%a0)
++	addql	#1,%a0@(CI_IDEPTH)
++	jbsr	_C_LABEL(virtsmp_clock_intr)	| (takes the clockframe)
++	GETCURCPU(%a0)
++	subql	#1,%a0@(CI_IDEPTH)
++	INTERRUPT_RESTOREREG
++	jra	_ASM_LABEL(rei)
++
++/*
++ * Secondary CPUs start here (virtsmp START_PC), with the MMU off,
++ * SR = 0x2700, %a0 = struct virt68k_hatch * and %sp = its h_stack.
++ * The kernel is mapped VA == PA, so its symbols can be used directly.
++ * Enable the MMU like the boot CPU did (68040/68060 only), load our
++ * VBR, switch to the stack of our idle lwp and call cpu_hatch(ci).
++ */
++ENTRY_NOPROFILE(cpu_spinup_trampoline)
++	movw	#PSL_HIGHIPL,%sr
++	movl	%a0,%a5				| hatch
++	movl	#CACHE_OFF,%d0
++	movc	%d0,%cacr
++	moveq	#FC_USERD,%d0
++	movc	%d0,%sfc
++	movc	%d0,%dfc
++	movl	_C_LABEL(Sysseg_pa),%d1
++	.long	0x4e7b1807			| movc d1,srp
++	.long	0x4e7b1806			| movc d1,urp
++	pea	_C_LABEL(mmu_tt40)
++	jbsr	_C_LABEL(mmu_load_tt40)
++	addql	#4,%sp
++	.word	0xf4d8				| cinva bc
++	.word	0xf518				| pflusha
++	movl	#MMU40_TCR_BITS,%d0
++	.long	0x4e7b0003			| movc d0,tc
++#ifdef M68060
++	cmpl	#CPU_68060,_C_LABEL(cputype)
++	jne	1f
++	movl	#1,%d0
++	.long	0x4e7b0808			| movcl d0,pcr
++	movl	#0xa0808000,%d0
++	movc	%d0,%cacr
++	jra	2f
++1:
++#endif
++	movl	#0x80008000,%d0
++	movc	%d0,%cacr
++2:	movl	%a5@(HATCH_VBR),%a0
++	movc	%a0,%vbr
++	movl	%a5@(HATCH_SP),%sp
++	movl	#USRSTACK-4,%a2
++	movl	%a2,%usp
++	movl	%a5@(HATCH_CI),%sp@-
++	jbsr	_C_LABEL(cpu_hatch)		| does not return
++	PANIC("cpu_hatch returned")
++#endif /* MULTIPROCESSOR */
++
+ /*
+  * Primitives
+  */
+diff --git a/sys/arch/virt68k/virt68k/pmap_bootstrap.c b/sys/arch/virt68k/virt68k/pmap_bootstrap.c
+index d1da20871..778ded096 100644
+--- a/sys/arch/virt68k/virt68k/pmap_bootstrap.c
++++ b/sys/arch/virt68k/virt68k/pmap_bootstrap.c
+@@ -443,6 +443,10 @@ pmap_bootstrap(paddr_t nextpa, paddr_t firstpa)
+ 		va += PAGE_SIZE;
+ 		RELOC(CADDR2, void *) = (void *)va;
+ 		va += PAGE_SIZE;
++#ifdef MULTIPROCESSOR
++		/* one CADDR1/CADDR2 pair per CPU, see pmap_motorola.c */
++		va += 2 * (MAXCPUS - 1) * PAGE_SIZE;
++#endif
+ 		RELOC(vmmap, void *) = (void *)va;
+ 		va += PAGE_SIZE;
+ 		RELOC(msgbufaddr, void *) = (void *)va;
+-- 
+2.47.3
+

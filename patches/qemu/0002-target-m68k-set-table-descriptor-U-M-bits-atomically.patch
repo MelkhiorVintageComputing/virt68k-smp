@@ -1,0 +1,119 @@
+From 2a04c950dcf3ac2aa45c34023f57e875f7c39b3c Mon Sep 17 00:00:00 2001
+From: Romain Dolbeau <romain@dolbeau.org>
+Date: Sat, 17 Oct 2026 18:23:54 +0200
+Subject: [PATCH 2/6] target/m68k: set table descriptor U/M bits atomically
+
+The 68040 table walk updates the U and M bits of the descriptors with a
+plain load/store pair.  With MTTCG another vCPU may rewrite the same
+descriptor between the two, and the walk then writes back the stale
+value, losing the update.  The hardware uses a locked read-modify-write
+cycle; use an atomic OR on RAM-backed descriptors.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Romain Dolbeau <romain@dolbeau.org>
+---
+ target/m68k/helper.c | 55 +++++++++++++++++++++++++++++++++++---------
+ 1 file changed, 44 insertions(+), 11 deletions(-)
+
+diff --git a/target/m68k/helper.c b/target/m68k/helper.c
+index cdba8373df..175daa4906 100644
+--- a/target/m68k/helper.c
++++ b/target/m68k/helper.c
+@@ -728,6 +728,44 @@ static int check_TTR(uint32_t ttr, int *prot, target_ulong addr,
+     return 1;
+ }
+ 
++/*
++ * Set the U/M bits of a table descriptor during a table walk.  The 68040
++ * does this with a locked read-modify-write cycle; use an atomic OR on
++ * RAM so that a concurrent descriptor update by another CPU is not
++ * overwritten with the stale value read by this walk.
++ */
++static MemTxResult m68k_ptw_set_bits(CPUState *cs, hwaddr addr, uint32_t bits)
++{
++    MemTxResult res = MEMTX_OK;
++    MemoryRegion *mr;
++    hwaddr xlat, len = 4;
++    uint32_t val;
++
++    RCU_READ_LOCK_GUARD();
++    mr = address_space_translate(cs->as, addr, &xlat, &len, true,
++                                 MEMTXATTRS_UNSPECIFIED);
++    if (len == 4 && memory_region_is_ram(mr) && !memory_region_is_rom(mr)) {
++        void *host = address_space_map(cs->as, addr, &len, true,
++                                       MEMTXATTRS_UNSPECIFIED);
++        if (host && len == 4) {
++            qatomic_or((uint32_t *)host, cpu_to_be32(bits));
++            address_space_unmap(cs->as, host, len, true, len);
++            return MEMTX_OK;
++        }
++        if (host) {
++            address_space_unmap(cs->as, host, len, false, 0);
++        }
++    }
++
++    /* not plain RAM: no atomicity guarantee */
++    val = address_space_ldl(cs->as, addr, MEMTXATTRS_UNSPECIFIED, &res);
++    if (res == MEMTX_OK) {
++        address_space_stl(cs->as, addr, val | bits, MEMTXATTRS_UNSPECIFIED,
++                          &res);
++    }
++    return res;
++}
++
+ static int get_physical_address(CPUM68KState *env, hwaddr *physical,
+                                 int *prot, target_ulong address,
+                                 int access_type, target_ulong *page_size)
+@@ -777,8 +815,7 @@ static int get_physical_address(CPUM68KState *env, hwaddr *physical,
+         return -1;
+     }
+     if (!(next & M68K_DESC_USED) && !debug) {
+-        address_space_stl(cs->as, entry, next | M68K_DESC_USED,
+-                          MEMTXATTRS_UNSPECIFIED, &txres);
++        txres = m68k_ptw_set_bits(cs, entry, M68K_DESC_USED);
+         if (txres != MEMTX_OK) {
+             goto txfail;
+         }
+@@ -804,8 +841,7 @@ static int get_physical_address(CPUM68KState *env, hwaddr *physical,
+         return -1;
+     }
+     if (!(next & M68K_DESC_USED) && !debug) {
+-        address_space_stl(cs->as, entry, next | M68K_DESC_USED,
+-                          MEMTXATTRS_UNSPECIFIED, &txres);
++        txres = m68k_ptw_set_bits(cs, entry, M68K_DESC_USED);
+         if (txres != MEMTX_OK) {
+             goto txfail;
+         }
+@@ -845,25 +881,22 @@ static int get_physical_address(CPUM68KState *env, hwaddr *physical,
+     if (access_type & ACCESS_STORE) {
+         if (next & M68K_DESC_WRITEPROT) {
+             if (!(next & M68K_DESC_USED) && !debug) {
+-                address_space_stl(cs->as, entry, next | M68K_DESC_USED,
+-                                  MEMTXATTRS_UNSPECIFIED, &txres);
++                txres = m68k_ptw_set_bits(cs, entry, M68K_DESC_USED);
+                 if (txres != MEMTX_OK) {
+                     goto txfail;
+                 }
+             }
+         } else if ((next & (M68K_DESC_MODIFIED | M68K_DESC_USED)) !=
+                            (M68K_DESC_MODIFIED | M68K_DESC_USED) && !debug) {
+-            address_space_stl(cs->as, entry,
+-                              next | (M68K_DESC_MODIFIED | M68K_DESC_USED),
+-                              MEMTXATTRS_UNSPECIFIED, &txres);
++            txres = m68k_ptw_set_bits(cs, entry,
++                                      M68K_DESC_MODIFIED | M68K_DESC_USED);
+             if (txres != MEMTX_OK) {
+                 goto txfail;
+             }
+         }
+     } else {
+         if (!(next & M68K_DESC_USED) && !debug) {
+-            address_space_stl(cs->as, entry, next | M68K_DESC_USED,
+-                              MEMTXATTRS_UNSPECIFIED, &txres);
++            txres = m68k_ptw_set_bits(cs, entry, M68K_DESC_USED);
+             if (txres != MEMTX_OK) {
+                 goto txfail;
+             }
+-- 
+2.47.3
+

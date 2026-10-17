@@ -1,0 +1,230 @@
+From 6cf1dc916fa530559529f98b3302a315a513f203 Mon Sep 17 00:00:00 2001
+From: Romain Dolbeau <romain@dolbeau.org>
+Date: Sat, 17 Oct 2026 19:37:05 +0200
+Subject: [PATCH 3/3] m68k atomics: make the void
+ atomic_{add,sub,and,or,xor,inc,dec}_32 MP-safe
+
+They used a single read-modify-write instruction on memory, which is
+atomic with respect to interrupts but not with respect to other CPUs
+(only TAS, CAS and CAS2 are locked operations).  Use a CAS loop, like
+the _nv variants already do.  This also fixes them for threaded
+programs on a MULTIPROCESSOR kernel.
+
+pmap_tlb_shootdown(): snapshot the target CPUs once, so that a CPU
+joining kcpuset_running meanwhile does not unbalance the ack count.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ common/lib/libc/arch/m68k/atomic/atomic_add.S | 11 +++++++++--
+ common/lib/libc/arch/m68k/atomic/atomic_and.S | 11 +++++++++--
+ common/lib/libc/arch/m68k/atomic/atomic_dec.S | 10 +++++++++-
+ common/lib/libc/arch/m68k/atomic/atomic_inc.S | 10 +++++++++-
+ common/lib/libc/arch/m68k/atomic/atomic_or.S  | 11 +++++++++--
+ common/lib/libc/arch/m68k/atomic/atomic_sub.S | 11 +++++++++--
+ common/lib/libc/arch/m68k/atomic/atomic_xor.S | 11 +++++++++--
+ sys/arch/m68k/m68k/pmap_motorola.c            | 18 ++++++++++--------
+ 8 files changed, 73 insertions(+), 20 deletions(-)
+
+diff --git a/common/lib/libc/arch/m68k/atomic/atomic_add.S b/common/lib/libc/arch/m68k/atomic/atomic_add.S
+index a7328d51e..772428bb8 100644
+--- a/common/lib/libc/arch/m68k/atomic/atomic_add.S
++++ b/common/lib/libc/arch/m68k/atomic/atomic_add.S
+@@ -35,9 +35,16 @@
+ 	.align	2
+ 
+ ENTRY(_atomic_add_32)
++	/*
++	 * A read-modify-write instruction is only atomic with respect to
++	 * interrupts; with several CPUs it must be a CAS loop.
++	 */
+ 	movl	4(%sp), %a0
+-	movl	8(%sp), %d0
+-	addl	%d0, (%a0)
++1:	movl	(%a0), %d0
++	movl	%d0, %d1
++	addl	8(%sp), %d1
++	casl	%d0, %d1, (%a0)
++	bne	1b
+ 	rts
+ END(_atomic_add_32)
+ ATOMIC_OP_ALIAS(atomic_add_32,_atomic_add_32)
+diff --git a/common/lib/libc/arch/m68k/atomic/atomic_and.S b/common/lib/libc/arch/m68k/atomic/atomic_and.S
+index 293684ea4..342352b28 100644
+--- a/common/lib/libc/arch/m68k/atomic/atomic_and.S
++++ b/common/lib/libc/arch/m68k/atomic/atomic_and.S
+@@ -34,9 +34,16 @@
+ 	.text
+ 
+ ENTRY(_atomic_and_32)
++	/*
++	 * A read-modify-write instruction is only atomic with respect to
++	 * interrupts; with several CPUs it must be a CAS loop.
++	 */
+ 	movl	4(%sp), %a0
+-	movl	8(%sp), %d0
+-	andl	%d0, (%a0)
++1:	movl	(%a0), %d0
++	movl	%d0, %d1
++	andl	8(%sp), %d1
++	casl	%d0, %d1, (%a0)
++	bne	1b
+ 	rts
+ END(_atomic_and_32)
+ ATOMIC_OP_ALIAS(atomic_and_32,_atomic_and_32)
+diff --git a/common/lib/libc/arch/m68k/atomic/atomic_dec.S b/common/lib/libc/arch/m68k/atomic/atomic_dec.S
+index eebe446a7..15f191167 100644
+--- a/common/lib/libc/arch/m68k/atomic/atomic_dec.S
++++ b/common/lib/libc/arch/m68k/atomic/atomic_dec.S
+@@ -34,8 +34,16 @@
+ 	.text
+ 
+ ENTRY(_atomic_dec_32)
++	/*
++	 * A read-modify-write instruction is only atomic with respect to
++	 * interrupts; with several CPUs it must be a CAS loop.
++	 */
+ 	movl	4(%sp), %a0
+-	subql	#1, (%a0)
++1:	movl	(%a0), %d0
++	movl	%d0, %d1
++	subql	#1, %d1
++	casl	%d0, %d1, (%a0)
++	bne	1b
+ 	rts
+ END(_atomic_dec_32)
+ ATOMIC_OP_ALIAS(atomic_dec_32,_atomic_dec_32)
+diff --git a/common/lib/libc/arch/m68k/atomic/atomic_inc.S b/common/lib/libc/arch/m68k/atomic/atomic_inc.S
+index 783b0c11e..48d93f5a4 100644
+--- a/common/lib/libc/arch/m68k/atomic/atomic_inc.S
++++ b/common/lib/libc/arch/m68k/atomic/atomic_inc.S
+@@ -34,8 +34,16 @@
+ 	.text
+ 
+ ENTRY(_atomic_inc_32)
++	/*
++	 * A read-modify-write instruction is only atomic with respect to
++	 * interrupts; with several CPUs it must be a CAS loop.
++	 */
+ 	movl	4(%sp), %a0
+-	addql	#1, (%a0)
++1:	movl	(%a0), %d0
++	movl	%d0, %d1
++	addql	#1, %d1
++	casl	%d0, %d1, (%a0)
++	bne	1b
+ 	rts
+ END(_atomic_inc_32)
+ ATOMIC_OP_ALIAS(atomic_inc_32,_atomic_inc_32)
+diff --git a/common/lib/libc/arch/m68k/atomic/atomic_or.S b/common/lib/libc/arch/m68k/atomic/atomic_or.S
+index aef39f266..1260bfaf1 100644
+--- a/common/lib/libc/arch/m68k/atomic/atomic_or.S
++++ b/common/lib/libc/arch/m68k/atomic/atomic_or.S
+@@ -34,9 +34,16 @@
+ 	.text
+ 
+ ENTRY(_atomic_or_32)
++	/*
++	 * A read-modify-write instruction is only atomic with respect to
++	 * interrupts; with several CPUs it must be a CAS loop.
++	 */
+ 	movl	4(%sp), %a0
+-	movl	8(%sp), %d0
+-	orl	%d0, (%a0)
++1:	movl	(%a0), %d0
++	movl	%d0, %d1
++	orl	8(%sp), %d1
++	casl	%d0, %d1, (%a0)
++	bne	1b
+ 	rts
+ END(_atomic_or_32)
+ 
+diff --git a/common/lib/libc/arch/m68k/atomic/atomic_sub.S b/common/lib/libc/arch/m68k/atomic/atomic_sub.S
+index 17c26606d..14ca66e55 100644
+--- a/common/lib/libc/arch/m68k/atomic/atomic_sub.S
++++ b/common/lib/libc/arch/m68k/atomic/atomic_sub.S
+@@ -35,9 +35,16 @@
+ 	.align	2
+ 
+ ENTRY(_atomic_sub_32)
++	/*
++	 * A read-modify-write instruction is only atomic with respect to
++	 * interrupts; with several CPUs it must be a CAS loop.
++	 */
+ 	movl	4(%sp), %a0
+-	movl	8(%sp), %d0
+-	subl	%d0, (%a0)
++1:	movl	(%a0), %d0
++	movl	%d0, %d1
++	subl	8(%sp), %d1
++	casl	%d0, %d1, (%a0)
++	bne	1b
+ 	rts
+ END(_atomic_sub_32)
+ ATOMIC_OP_ALIAS(atomic_sub_32,_atomic_sub_32)
+diff --git a/common/lib/libc/arch/m68k/atomic/atomic_xor.S b/common/lib/libc/arch/m68k/atomic/atomic_xor.S
+index 77049962e..8e64340ce 100644
+--- a/common/lib/libc/arch/m68k/atomic/atomic_xor.S
++++ b/common/lib/libc/arch/m68k/atomic/atomic_xor.S
+@@ -34,9 +34,16 @@
+ 	.text
+ 
+ ENTRY(_atomic_xor_32)
++	/*
++	 * A read-modify-write instruction is only atomic with respect to
++	 * interrupts; with several CPUs it must be a CAS loop.
++	 */
+ 	movl	4(%sp), %a0
+-	movl	8(%sp), %d0
+-	eorl	%d0, (%a0)
++1:	movl	(%a0), %d0
++	movl	8(%sp), %d1
++	eorl	%d0, %d1
++	casl	%d0, %d1, (%a0)
++	bne	1b
+ 	rts
+ END(_atomic_xor_32)
+ 
+diff --git a/sys/arch/m68k/m68k/pmap_motorola.c b/sys/arch/m68k/m68k/pmap_motorola.c
+index cecddc33d..7f414a38a 100644
+--- a/sys/arch/m68k/m68k/pmap_motorola.c
++++ b/sys/arch/m68k/m68k/pmap_motorola.c
+@@ -365,8 +365,8 @@ void
+ pmap_tlb_shootdown(vaddr_t va)
+ {
+ 	CPU_INFO_ITERATOR cii;
+-	struct cpu_info *ci, *self;
+-	u_int n;
++	struct cpu_info *ci, *self, *targets[MAXCPUS];
++	u_int n, i;
+ 	int s;
+ 
+ 	if (kcpuset_running == NULL || kcpuset_countset(kcpuset_running) < 2)
+@@ -377,17 +377,19 @@ pmap_tlb_shootdown(vaddr_t va)
+ 	while (!__cpu_simple_lock_try(&pmap_tlb_lock))
+ 		continue;
+ 	self = curcpu();
+-	n = 0;
+ 	pmap_tlb_va = va;
++	/*
++	 * Snapshot the targets once: CPUs may join kcpuset_running while we
++	 * are here, and the count must match the IPIs sent.
++	 */
++	n = 0;
+ 	for (CPU_INFO_FOREACH(cii, ci)) {
+ 		if (ci != self && kcpuset_isset(kcpuset_running, cpu_index(ci)))
+-			n++;
++			targets[n++] = ci;
+ 	}
+ 	pmap_tlb_pending = n;
+-	for (CPU_INFO_FOREACH(cii, ci)) {
+-		if (ci != self && kcpuset_isset(kcpuset_running, cpu_index(ci)))
+-			m68k_send_tlb_ipi(ci);
+-	}
++	for (i = 0; i < n; i++)
++		m68k_send_tlb_ipi(targets[i]);
+ 	while (pmap_tlb_pending != 0)
+ 		continue;
+ 	__cpu_simple_unlock(&pmap_tlb_lock);
+-- 
+2.47.3
+

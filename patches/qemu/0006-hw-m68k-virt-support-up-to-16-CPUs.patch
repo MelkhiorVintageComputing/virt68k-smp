@@ -1,0 +1,151 @@
+From 08e24df3fb8ec3f57ece4beb34e9c5e600f9c0c1 Mon Sep 17 00:00:00 2001
+From: Romain Dolbeau <romain@dolbeau.org>
+Date: Sat, 17 Oct 2026 18:23:55 +0200
+Subject: [PATCH 6/6] hw/m68k/virt: support up to 16 CPUs
+
+With more than one CPU, create the secondary CPUs powered off, and use
+the virt-smp controller instead of the m68k-irq-controller: the
+goldfish-pic outputs go to virt-smp, which delivers them, the IPIs and
+the per-CPU timer interrupts to the CPUs.  Its base address and the
+number of CPUs are passed in a BI_VIRT_SMP_BASE bootinfo record.
+
+With -smp 1 the machine is unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Romain Dolbeau <romain@dolbeau.org>
+---
+ hw/m68k/Kconfig |  1 +
+ hw/m68k/virt.c  | 49 +++++++++++++++++++++++++++++++++++++++++++------
+ 2 files changed, 44 insertions(+), 6 deletions(-)
+
+diff --git a/hw/m68k/Kconfig b/hw/m68k/Kconfig
+index aff769b30f..d1c49dc685 100644
+--- a/hw/m68k/Kconfig
++++ b/hw/m68k/Kconfig
+@@ -42,6 +42,7 @@ config M68K_VIRT
+     depends on M68K
+     select M68K_IRQC
+     select VIRT_CTRL
++    select VIRT_SMP
+     select GOLDFISH_PIC
+     select GOLDFISH_TTY
+     select GOLDFISH_RTC
+diff --git a/hw/m68k/virt.c b/hw/m68k/virt.c
+index 51158ce1c0..20740d7b7c 100644
+--- a/hw/m68k/virt.c
++++ b/hw/m68k/virt.c
+@@ -31,6 +31,7 @@
+ 
+ #include "hw/intc/m68k_irqc.h"
+ #include "hw/misc/virt_ctrl.h"
++#include "hw/misc/virt_smp.h"
+ #include "hw/char/goldfish_tty.h"
+ #include "hw/rtc/goldfish_rtc.h"
+ #include "hw/intc/goldfish_pic.h"
+@@ -54,6 +55,10 @@
+  *               IRQ #1 -> goldfish-rtc
+  *               IRQ #2 to IRQ #32 -> unused
+  * CPU IRQ #7 -> NMI
++ *
++ * With more than one CPU, the 7 levels go to the virt-smp controller
++ * instead of the m68k-irq-controller.  It routes each level to one CPU
++ * and adds per-CPU IPI and timer interrupts.
+  */
+ 
+ #define PIC_IRQ_BASE(num)     (8 + (num - 1) * 32)
+@@ -87,6 +92,9 @@
+ #define VIRT_VIRTIO_MMIO_BASE 0xff010000     /* MMIO: 0xff010000 - 0xff01ffff */
+ #define VIRT_VIRTIO_IRQ_BASE  PIC_IRQ(2, 1)  /* PIC: 2, 3, 4, 5, IRQ: ALL */
+ 
++/* 1 virt-smp, only with more than one CPU */
++#define VIRT_SMP_MMIO_BASE    0xff00a000     /* MMIO: 0xff00a000 - 0xff00afff */
++
+ typedef struct {
+     M68kCPU *cpu;
+     hwaddr initial_pc;
+@@ -104,6 +112,12 @@ static void main_cpu_reset(void *opaque)
+     cpu->env.pc = reset_info->initial_pc;
+ }
+ 
++static void secondary_cpu_reset(void *opaque)
++{
++    /* start-powered-off: the CPU stays halted until virt-smp starts it */
++    cpu_reset(CPU(opaque));
++}
++
+ static void rerandomize_rng_seed(void *opaque)
+ {
+     struct bi_record *rng_seed = opaque;
+@@ -125,6 +139,7 @@ static void virt_init(MachineState *machine)
+     hwaddr parameters_base;
+     DeviceState *dev;
+     DeviceState *irqc_dev;
++    unsigned int smp_cpus = machine->smp.cpus;
+     DeviceState *pic_dev[VIRT_GF_PIC_NB];
+     SysBusDevice *sysbus;
+     hwaddr io_base;
+@@ -145,7 +160,18 @@ static void virt_init(MachineState *machine)
+     reset_info = g_new0(ResetInfo, 1);
+ 
+     /* init CPUs */
+-    cpu = M68K_CPU(cpu_create(machine->cpu_type));
++    for (i = 0; i < smp_cpus; i++) {
++        Object *obj = object_new(machine->cpu_type);
++
++        if (i > 0) {
++            object_property_set_bool(obj, "start-powered-off", true,
++                                     &error_abort);
++            qemu_register_reset(secondary_cpu_reset, obj);
++        } else {
++            cpu = M68K_CPU(obj);
++        }
++        qdev_realize_and_unref(DEVICE(obj), NULL, &error_fatal);
++    }
+ 
+     reset_info->cpu = cpu;
+     qemu_register_reset(main_cpu_reset, reset_info);
+@@ -155,10 +181,17 @@ static void virt_init(MachineState *machine)
+ 
+     /* IRQ Controller */
+ 
+-    irqc_dev = qdev_new(TYPE_M68K_IRQC);
+-    object_property_set_link(OBJECT(irqc_dev), "m68k-cpu",
+-                             OBJECT(cpu), &error_abort);
+-    sysbus_realize_and_unref(SYS_BUS_DEVICE(irqc_dev), &error_fatal);
++    if (smp_cpus > 1) {
++        irqc_dev = qdev_new(TYPE_VIRT_SMP);
++        qdev_prop_set_uint32(irqc_dev, "num-cpus", smp_cpus);
++        sysbus_realize_and_unref(SYS_BUS_DEVICE(irqc_dev), &error_fatal);
++        sysbus_mmio_map(SYS_BUS_DEVICE(irqc_dev), 0, VIRT_SMP_MMIO_BASE);
++    } else {
++        irqc_dev = qdev_new(TYPE_M68K_IRQC);
++        object_property_set_link(OBJECT(irqc_dev), "m68k-cpu",
++                                 OBJECT(cpu), &error_abort);
++        sysbus_realize_and_unref(SYS_BUS_DEVICE(irqc_dev), &error_fatal);
++    }
+ 
+     /*
+      * 6 goldfish-pic
+@@ -269,6 +302,10 @@ static void virt_init(MachineState *machine)
+                   VIRT_CTRL_MMIO_BASE, VIRT_CTRL_IRQ_BASE);
+         BOOTINFO2(param_ptr, BI_VIRT_VIRTIO_BASE,
+                   VIRT_VIRTIO_MMIO_BASE, VIRT_VIRTIO_IRQ_BASE);
++        if (smp_cpus > 1) {
++            BOOTINFO2(param_ptr, BI_VIRT_SMP_BASE,
++                      VIRT_SMP_MMIO_BASE, smp_cpus);
++        }
+ 
+         if (kernel_cmdline) {
+             BOOTINFOSTR(param_ptr, BI_COMMAND_LINE,
+@@ -316,7 +353,7 @@ static void virt_machine_class_init(ObjectClass *oc, const void *data)
+     mc->desc = "QEMU M68K Virtual Machine";
+     mc->init = virt_init;
+     mc->default_cpu_type = M68K_CPU_TYPE_NAME("m68040");
+-    mc->max_cpus = 1;
++    mc->max_cpus = VIRT_SMP_MAX_CPUS;
+     mc->no_floppy = 1;
+     mc->no_parallel = 1;
+     mc->default_ram_id = "m68k_virt.ram";
+-- 
+2.47.3
+

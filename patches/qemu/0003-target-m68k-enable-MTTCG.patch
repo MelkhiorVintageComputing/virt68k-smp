@@ -1,0 +1,32 @@
+From 8cf18be9e1a768f1230408a2856d21086d064b12 Mon Sep 17 00:00:00 2001
+From: Romain Dolbeau <romain@dolbeau.org>
+Date: Sat, 17 Oct 2026 18:23:54 +0200
+Subject: [PATCH 3/6] target/m68k: enable MTTCG
+
+The m68k front end already implements TAS, CAS and CAS2 with atomic
+operations (CAS2 falls back to exclusive execution when the operands
+are not adjacent), the table walk now updates descriptors atomically,
+and the default memory order is TCG_MO_ALL.  Allow multi-threaded TCG.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Romain Dolbeau <romain@dolbeau.org>
+---
+ target/m68k/cpu.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/target/m68k/cpu.c b/target/m68k/cpu.c
+index 9ad3057d91..d67f53bc43 100644
+--- a/target/m68k/cpu.c
++++ b/target/m68k/cpu.c
+@@ -631,7 +631,7 @@ static const struct SysemuCPUOps m68k_sysemu_ops = {
+ static const TCGCPUOps m68k_tcg_ops = {
+     /* MTTCG not yet supported: require strict ordering */
+     .guest_default_memory_order = TCG_MO_ALL,
+-    .mttcg_supported = false,
++    .mttcg_supported = true,
+ 
+     .initialize = m68k_tcg_init,
+     .translate_code = m68k_translate_code,
+-- 
+2.47.3
+

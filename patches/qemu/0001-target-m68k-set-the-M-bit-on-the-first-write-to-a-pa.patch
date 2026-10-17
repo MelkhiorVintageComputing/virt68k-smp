@@ -1,0 +1,44 @@
+From ef8bdea70093d3dc8ab0a510c942c0eabf2b365b Mon Sep 17 00:00:00 2001
+From: Romain Dolbeau <romain@dolbeau.org>
+Date: Sat, 17 Oct 2026 17:26:46 +0200
+Subject: [PATCH 1/6] target/m68k: set the M bit on the first write to a page
+ loaded by a read
+
+On the 68040, when an ATC entry for a writable page was created by a
+read access and the page descriptor M bit is clear, the first write to
+that page triggers a table search that sets M.  QEMU created a writable
+TLB entry on read, so a later write never walked the tables again and M
+stayed clear.  Guests relying on M to track dirty pages (e.g. the
+NetBSD m68k pmap) could then miss modifications.
+
+Do not grant PAGE_WRITE when filling the TLB for a non-store access to
+a page whose M bit is clear.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Romain Dolbeau <romain@dolbeau.org>
+---
+ target/m68k/helper.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/target/m68k/helper.c b/target/m68k/helper.c
+index 5f91d206f5..cdba8373df 100644
+--- a/target/m68k/helper.c
++++ b/target/m68k/helper.c
+@@ -890,6 +890,14 @@ static int get_physical_address(CPUM68KState *env, hwaddr *physical,
+         if (access_type & ACCESS_STORE) {
+             return -1;
+         }
++    } else if (!(access_type & ACCESS_STORE) &&
++               !(next & M68K_DESC_MODIFIED)) {
++        /*
++         * The page has not been modified yet: do not let a read fill a
++         * writable TLB entry, so that the first write walks the tables
++         * again and sets the M bit, as the 68040 ATC does.
++         */
++        *prot &= ~PAGE_WRITE;
+     }
+     if (next & M68K_DESC_SUPERONLY) {
+         if ((access_type & ACCESS_SUPER) == 0) {
+-- 
+2.47.3
+

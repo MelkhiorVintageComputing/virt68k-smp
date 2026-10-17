@@ -1,0 +1,860 @@
+From fbd3de122b771f73abbfcd29af355d0a22d1f4c3 Mon Sep 17 00:00:00 2001
+From: Romain Dolbeau <romain@dolbeau.org>
+Date: Sat, 17 Oct 2026 18:58:17 +0200
+Subject: [PATCH 1/3] m68k, virt68k: per-CPU state for MULTIPROCESSOR (step N1)
+
+With options MULTIPROCESSOR (only virt68k's GENERIC.MP for now):
+- curcpu() is found through the VBR: each CPU has its own vector table,
+  followed by a pointer to its cpu_info (the boot CPU uses vectab[],
+  which gets one more slot).  locore points the VBR at it first thing.
+- curlwp, curpcb, astpending and intr_depth become cpu_info fields
+  (ci_curlwp, ci_curpcb, ci_astpending, ci_idepth); cpu_switchto() uses
+  a per-CPU scratch stack (ci_tmpstk).  The assembly uses new GETCURCPU,
+  GETCURLWP and GETCURPCB macros from <m68k/asm.h>.
+- cpu_need_resched(), cpu_set_ast(), xc_send_ipi() and cpu_ipi() are
+  functions that will IPI other CPUs through virtsmp(4).
+
+Kernels without MULTIPROCESSOR are unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ sys/arch/m68k/include/asm.h          |  36 ++++++-
+ sys/arch/m68k/include/cpu.h          |  67 +++++++++++++
+ sys/arch/m68k/include/intr.h         |   2 +
+ sys/arch/m68k/include/pcb.h          |   7 ++
+ sys/arch/m68k/include/vectors.h      |  11 ++-
+ sys/arch/m68k/m68k/copy.s            |   5 +
+ sys/arch/m68k/m68k/lock_stubs.s      |  11 +++
+ sys/arch/m68k/m68k/m68k_intr.c       |   2 +
+ sys/arch/m68k/m68k/m68k_trap.c       |   2 +
+ sys/arch/m68k/m68k/switch_subr.s     |  21 +++-
+ sys/arch/m68k/m68k/vectors.c         |  17 +++-
+ sys/arch/virt68k/conf/GENERIC.MP     |   7 ++
+ sys/arch/virt68k/conf/files.virt68k  |   1 +
+ sys/arch/virt68k/virt68k/cpu_mp.c    | 143 +++++++++++++++++++++++++++
+ sys/arch/virt68k/virt68k/cpu_mp.h    |  27 +++++
+ sys/arch/virt68k/virt68k/genassym.cf |   8 ++
+ sys/arch/virt68k/virt68k/intr.c      |   2 +
+ sys/arch/virt68k/virt68k/locore.s    |  44 ++++++++-
+ sys/arch/virt68k/virt68k/machdep.c   |  10 ++
+ 19 files changed, 411 insertions(+), 12 deletions(-)
+ create mode 100644 sys/arch/virt68k/conf/GENERIC.MP
+ create mode 100644 sys/arch/virt68k/virt68k/cpu_mp.c
+ create mode 100644 sys/arch/virt68k/virt68k/cpu_mp.h
+
+diff --git a/sys/arch/m68k/include/asm.h b/sys/arch/m68k/include/asm.h
+index d1bce468c..b7a42c2f0 100644
+--- a/sys/arch/m68k/include/asm.h
++++ b/sys/arch/m68k/include/asm.h
+@@ -204,9 +204,41 @@
+ 	9:	.asciz	x			;	\
+ 		.even
+ 
++/*
++ * Access to the per-CPU state.  "ar" must be an address register.
++ * With MULTIPROCESSOR, the cpu_info pointer follows the vector table of
++ * the CPU (see <m68k/cpu.h>).  Offsets (VB_CI, CI_*) come from assym.h.
++ */
++#ifdef MULTIPROCESSOR
++#define	GETCURCPU(ar)						\
++	movc	%vbr,ar;					\
++	movl	ar@(VB_CI),ar
++#define	GETCURLWP(ar)						\
++	GETCURCPU(ar);						\
++	movl	ar@(CI_CURLWP),ar
++#define	GETCURPCB(ar)						\
++	GETCURCPU(ar);						\
++	movl	ar@(CI_CURPCB),ar
++#else
++#define	GETCURCPU(ar)						\
++	lea	_C_LABEL(cpu_info_store),ar
++#define	GETCURLWP(ar)						\
++	movl	_C_LABEL(curlwp),ar
++#define	GETCURPCB(ar)						\
++	movl	_C_LABEL(curpcb),ar
++#endif
++
+ /* 64-bit counter increments */
++#ifdef MULTIPROCESSOR
++#define	CPUINFO_COUNTER(n)					\
++	GETCURCPU(%a1);						\
++	lea	(n)+4(%a1),%a1
++#else
++#define	CPUINFO_COUNTER(n)					\
++	lea	_C_LABEL(cpu_info_store)+(n)+4,%a1
++#endif
+ #define CPUINFO_INCREMENT(n)					\
+-	lea	_C_LABEL(cpu_info_store)+(n)+4,%a1;		\
++	CPUINFO_COUNTER(n);					\
+ 	addq.l	#1,(%a1);					\
+ 	clr.l	%d0;		/* doesn't change CCR[X] */	\
+ 	move.l	-(%a1),%d1;	/* doesn't change CCR[X] */	\
+@@ -215,7 +247,7 @@
+ 
+ /* 64-bit counter increments */
+ #define CPUINFO_ADD(n, addend)					\
+-	lea	_C_LABEL(cpu_info_store)+(n)+4,%a1;		\
++	CPUINFO_COUNTER(n);					\
+ 	add.l	addend,(%a1);					\
+ 	clr.l	%d0;		/* doesn't change CCR[X] */	\
+ 	move.l	-(%a1),%d1;	/* doesn't change CCR[X] */	\
+diff --git a/sys/arch/m68k/include/cpu.h b/sys/arch/m68k/include/cpu.h
+index 477075b53..33bf4bd11 100644
+--- a/sys/arch/m68k/include/cpu.h
++++ b/sys/arch/m68k/include/cpu.h
+@@ -43,6 +43,7 @@
+ 
+ #if defined(_KERNEL_OPT)
+ #include "opt_m68k_arch.h"	/* XXX Should not do this here. */
++#include "opt_multiprocessor.h"
+ #endif
+ 
+ /*
+@@ -124,15 +125,64 @@ struct cpu_info {
+ 	volatile int	ci_want_resched;
+ 	volatile int	ci_idepth;
+ 	struct lwp *ci_onproc;		/* current user LWP / kthread */
++#ifdef MULTIPROCESSOR
++	struct cpu_info *ci_self;	/* this structure */
++	struct lwp *ci_curlwp;		/* replaces the curlwp global */
++	struct pcb *ci_curpcb;		/* replaces the curpcb global */
++	volatile int ci_astpending;	/* replaces the astpending global */
++	void	*ci_tmpstk;		/* top of the scratch stack used by
++					   cpu_switchto() */
++	void	**ci_vectors;		/* vector table (what VBR points to) */
++	struct cpu_info *ci_next;	/* list of all CPUs */
++	void	*ci_md;			/* port-specific per-CPU data */
++#endif
+ };
+ #endif /* _KERNEL || _KMEMUSER */
+ 
++#ifdef MULTIPROCESSOR
++/*
++ * Each CPU has its own vector table.  The VBR points to it, and the
++ * pointer to the cpu_info of the CPU follows the table, so that
++ * curcpu() is "movec %vbr,%aN; movl %aN@(M68K_VECBLK_CI),%aN".
++ */
++#define	M68K_NVECTORS		256
++#define	M68K_VECBLK_CI		(M68K_NVECTORS * 4)
++#if defined(_KERNEL) && !defined(_LOCORE)
++struct m68k_vecblk {			/* (the boot CPU uses vectab[]) */
++	void		*vb_vectors[M68K_NVECTORS];
++	struct cpu_info	*vb_ci;
++};
++#endif
++#endif /* MULTIPROCESSOR */
++
+ #ifdef _KERNEL
+ extern struct cpu_info cpu_info_store;
+ 
+ struct	proc;
++struct	lwp;
+ void	cpu_proc_fork(struct proc *, struct proc *);
+ 
++#ifdef MULTIPROCESSOR
++static __inline struct cpu_info *
++m68k_curcpu(void)
++{
++	struct cpu_info *ci;
++
++	__asm volatile("movc %%vbr,%0; movl %0@(%c1),%0"
++	    : "=a" (ci) : "i" (M68K_VECBLK_CI));
++	return ci;
++}
++#define	curcpu()	m68k_curcpu()
++#define	cpu_number()	(curcpu()->ci_cpuid)
++
++extern struct cpu_info *cpu_info_list;
++#define	CPU_INFO_ITERATOR	int __unused
++#define	CPU_INFO_FOREACH(cii, ci)	\
++	ci = cpu_info_list; ci != NULL; ci = ci->ci_next
++#define	CPU_IS_PRIMARY(ci)	((ci) == &cpu_info_store)
++
++void	cpu_boot_secondary_processors(void);
++#else
+ #define	curcpu()	(&cpu_info_store)
+ 
+ /*
+@@ -140,6 +190,7 @@ void	cpu_proc_fork(struct proc *, struct proc *);
+  * referenced in generic code
+  */
+ #define cpu_number()			0
++#endif /* MULTIPROCESSOR */
+ 
+ #define LWP_PC(l)	(((struct trapframe *)((l)->l_md.md_regs))->tf_pc)
+ 
+@@ -184,7 +235,11 @@ struct clockframe {
+  * (Remember, the clock interrupt handler itself will cause the
+  * depth counter to be incremented).
+  */
++#ifdef MULTIPROCESSOR
++#define	intr_depth		(curcpu()->ci_idepth)
++#else
+ extern volatile unsigned int intr_depth;
++#endif
+ #define	CLKF_INTR(framep)	(intr_depth > 1)
+ #endif
+ 
+@@ -192,6 +247,17 @@ extern volatile unsigned int intr_depth;
+ #define	cpu_set_hw_ast(l)	__nothing
+ #endif
+ 
++#ifdef MULTIPROCESSOR
++#define	astpending		(curcpu()->ci_astpending)
++/* Request an AST on the CPU running l; see cpu_need_resched(). */
++void	cpu_set_ast(struct lwp *);
++/*
++ * Preempt the current process if in interrupt from user mode,
++ * or after the current trap/syscall if in system mode.  For another
++ * CPU, this sends it an IPI.
++ */
++void	cpu_need_resched(struct cpu_info *, struct lwp *, int);
++#else
+ extern volatile int astpending;
+ #define	cpu_set_ast(l)							\
+ 	do {								\
+@@ -206,6 +272,7 @@ extern volatile int astpending;
+ 	do {								\
+ 		__USE(ci); __USE(flags); cpu_set_ast(l);		\
+ 	} while (/*CONSTCOND*/0)
++#endif /* MULTIPROCESSOR */
+ 
+ /*
+  * Give a profiling tick to the current process when the user profiling
+diff --git a/sys/arch/m68k/include/intr.h b/sys/arch/m68k/include/intr.h
+index 575baeaad..ea1b1ee72 100644
+--- a/sys/arch/m68k/include/intr.h
++++ b/sys/arch/m68k/include/intr.h
+@@ -70,7 +70,9 @@ typedef struct {
+ 
+ #ifndef _LOCORE
+ 
++#ifndef MULTIPROCESSOR		/* else a macro in <m68k/cpu.h> */
+ extern volatile unsigned int intr_depth;/* interrupt depth */
++#endif
+ extern const uint16_t ipl2psl_table[NIPL];
+ 
+ typedef int ipl_t;		/* logical IPL_* value */
+diff --git a/sys/arch/m68k/include/pcb.h b/sys/arch/m68k/include/pcb.h
+index 1ac1c1812..f8b66be83 100644
+--- a/sys/arch/m68k/include/pcb.h
++++ b/sys/arch/m68k/include/pcb.h
+@@ -70,6 +70,13 @@ struct md_coredump {
+ 	int	md_exec[16];	/* exec structure for HP-UX core dumps */
+ };
+ 
++#if defined(_KERNEL_OPT)
++#include "opt_multiprocessor.h"
++#endif
++#ifdef MULTIPROCESSOR
++#define	curpcb		(curcpu()->ci_curpcb)
++#else
+ extern struct pcb *curpcb;
++#endif
+ 
+ #endif /* _M68K_PCB_H_ */
+diff --git a/sys/arch/m68k/include/vectors.h b/sys/arch/m68k/include/vectors.h
+index 91fa3b526..0310863b9 100644
+--- a/sys/arch/m68k/include/vectors.h
++++ b/sys/arch/m68k/include/vectors.h
+@@ -126,7 +126,16 @@
+ 
+ #ifdef _KERNEL
+ 
+-extern void *vectab[NVECTORS];
++#if defined(_KERNEL_OPT)
++#include "opt_multiprocessor.h"
++#endif
++#ifdef MULTIPROCESSOR
++/* followed by the cpu_info pointer of the boot CPU, see <m68k/cpu.h> */
++#define	VECTAB_SIZE	(NVECTORS + 1)
++#else
++#define	VECTAB_SIZE	NVECTORS
++#endif
++extern void *vectab[VECTAB_SIZE];
+ extern void **saved_vbr;
+ 
+ void	vec_init(void);
+diff --git a/sys/arch/m68k/m68k/copy.s b/sys/arch/m68k/m68k/copy.s
+index d7f37defc..bdca05c0b 100644
+--- a/sys/arch/m68k/m68k/copy.s
++++ b/sys/arch/m68k/m68k/copy.s
+@@ -67,6 +67,8 @@
+  * copyin/copyout, ufetch/ustore, etc.
+  */
+ 
++#include "opt_multiprocessor.h"
++
+ #include <sys/errno.h>
+ #include <machine/asm.h>
+ 
+@@ -75,11 +77,14 @@
+ 	.file	"copy.s"
+ 	.text
+ 
++#ifndef MULTIPROCESSOR		/* else per-CPU, from <machine/asm.h> */
++#undef	GETCURPCB
+ #ifdef CI_CURPCB
+ #define	GETCURPCB(r)	movl	_C_LABEL(cpu_info_store)+CI_CURPCB,r
+ #else
+ #define	GETCURPCB(r)	movl	_C_LABEL(curpcb),r
+ #endif
++#endif
+ 
+ #ifdef	DIAGNOSTIC
+ /*
+diff --git a/sys/arch/m68k/m68k/lock_stubs.s b/sys/arch/m68k/m68k/lock_stubs.s
+index 96ea413a9..a01887d89 100644
+--- a/sys/arch/m68k/m68k/lock_stubs.s
++++ b/sys/arch/m68k/m68k/lock_stubs.s
+@@ -30,6 +30,7 @@
+  */
+ 
+ #include "opt_lockdebug.h"
++#include "opt_multiprocessor.h"
+ 
+ #include <machine/asm.h>
+ 
+@@ -89,7 +90,12 @@ STRONG_ALIAS(_atomic_cas_ulong_ni,_atomic_cas_32)
+  */
+ ENTRY(mutex_enter)
+ 	movq	#0,%d0
++#ifdef MULTIPROCESSOR
++	GETCURLWP(%a1)
++	movl	%a1,%d1
++#else
+ 	movl	_C_LABEL(curlwp),%d1
++#endif
+ 	movl	4(%sp),%a0
+ 	casl	%d0,%d1,(%a0)
+ 	bnes	1f
+@@ -100,7 +106,12 @@ ENTRY(mutex_enter)
+  * void mutex_exit(kmutex_t *mtx);
+  */
+ ENTRY(mutex_exit)
++#ifdef MULTIPROCESSOR
++	GETCURLWP(%a1)
++	movl	%a1,%d0
++#else
+ 	movl	_C_LABEL(curlwp),%d0
++#endif
+ 	movq	#0,%d1
+ 	movl	4(%sp),%a0
+ 	casl	%d0,%d1,(%a0)
+diff --git a/sys/arch/m68k/m68k/m68k_intr.c b/sys/arch/m68k/m68k/m68k_intr.c
+index 2e65896fa..b6286fd54 100644
+--- a/sys/arch/m68k/m68k/m68k_intr.c
++++ b/sys/arch/m68k/m68k/m68k_intr.c
+@@ -70,7 +70,9 @@ extern char intrstub_vectored[];
+ /* A dummy event counter where interrupt stats go to die. */
+ static struct evcnt bitbucket;
+ 
++#ifndef MULTIPROCESSOR		/* else ci_idepth */
+ volatile unsigned int intr_depth;	/* updated in assembly glue */
++#endif
+ 
+ static struct m68k_intrhand_list m68k_intrhands_autovec[NAUTOVECTORS];
+ #ifdef __HAVE_M68K_INTR_VECTORED
+diff --git a/sys/arch/m68k/m68k/m68k_trap.c b/sys/arch/m68k/m68k/m68k_trap.c
+index 5e8193821..4406f4b80 100644
+--- a/sys/arch/m68k/m68k/m68k_trap.c
++++ b/sys/arch/m68k/m68k/m68k_trap.c
+@@ -59,7 +59,9 @@ __KERNEL_RCSID(0, "$NetBSD: m68k_trap.c,v 1.4 2024/01/20 00:15:31 thorpej Exp $"
+ 
+ extern int suline(void *, void *);	/* locore.s */
+ 
++#ifndef MULTIPROCESSOR		/* else ci_astpending */
+ volatile int astpending;
++#endif
+ 
+ #ifdef M68060
+ #define	KDFAULT_060(c)	(cputype == CPU_68060 && ((c) & FSLW_TM_SV))
+diff --git a/sys/arch/m68k/m68k/switch_subr.s b/sys/arch/m68k/m68k/switch_subr.s
+index 230e7a4b5..32e3b7806 100644
+--- a/sys/arch/m68k/m68k/switch_subr.s
++++ b/sys/arch/m68k/m68k/switch_subr.s
+@@ -69,7 +69,9 @@
+  */
+ 
+ 	.data
++#ifndef MULTIPROCESSOR		/* else ci_curpcb */
+ GLOBAL(curpcb)
++#endif
+ GLOBAL(masterpaddr)		| XXXcompatibility (debuggers)
+ 	.long	0
+ 
+@@ -133,9 +135,15 @@ ENTRY(cpu_switchto)
+ #endif	/* !_M68K_CUSTOM_FPU_CTX */
+ 
+ 	movl	8(%sp),%a0		| get newlwp
+-	movl	%a0,_C_LABEL(curlwp)	| curlwp = new lwp
+ 	movl	L_PCB(%a0),%a1		| get its pcb
++#ifdef MULTIPROCESSOR
++	GETCURCPU(%a2)			| (a2 was saved above)
++	movl	%a0,%a2@(CI_CURLWP)	| curlwp = new lwp
++	movl	%a1,%a2@(CI_CURPCB)	| curpcb = new pcb
++#else
++	movl	%a0,_C_LABEL(curlwp)	| curlwp = new lwp
+ 	movl	%a1,_C_LABEL(curpcb)	| curpcb = new pcb
++#endif
+ 
+ 	/*
+ 	 * Check for restartable atomic sequences (RAS)
+@@ -151,16 +159,21 @@ ENTRY(cpu_switchto)
+ 	movql	#-1,%d0
+ 	cmpl	%a0,%d0			| a0 == -1?
+ 	jeq	1f			| yes, skip it.
+-	movl	_C_LABEL(curlwp),%a1
++	GETCURLWP(%a1)
+ 	movl	L_MD_REGS(%a1),%a1
+ 	movl	%a0,TF_PC(%a1)		| fixup return PC
+ 1:
+-	movl	_C_LABEL(curlwp),%a0	| recover new lwp
+-	movl	_C_LABEL(curpcb),%a1	| recover new pcb
++	GETCURLWP(%a0)			| recover new lwp
++	GETCURPCB(%a1)			| recover new pcb
+ 2:
+ 	movl	%a0,%d0			| free up %a0
+ 	movl	4(%sp),%d1		| get oldlwp for return value
++#ifdef MULTIPROCESSOR
++	GETCURCPU(%a2)
++	movl	%a2@(CI_TMPSTK),%sp	| switch to tmp stack in case of NMI
++#else
+ 	lea	_ASM_LABEL(tmpstk),%sp	| switch to tmp stack in case of NMI
++#endif
+ 
+ 	moveml	PCB_REGS(%a1),%d2-%d7/%a2-%a7 | restore registers
+ 	movl	PCB_USP(%a1),%a0
+diff --git a/sys/arch/m68k/m68k/vectors.c b/sys/arch/m68k/m68k/vectors.c
+index e03dc9233..b893d0010 100644
+--- a/sys/arch/m68k/m68k/vectors.c
++++ b/sys/arch/m68k/m68k/vectors.c
+@@ -259,7 +259,10 @@ extern char FP_CALL_TOP[], I_CALL_TOP[];
+ #define	UNIMP_II_HANDLER	badtrap
+ #endif
+ 
+-void *vectab[NVECTORS] = {
++void *vectab[VECTAB_SIZE] = {
++#ifdef MULTIPROCESSOR
++	[NVECTORS]		=	&cpu_info_store,
++#endif
+ 	[VECI_RIISP]		=	MACHINE_RESET_SP,
+ 	[VECI_RIPC]		=	MACHINE_RESET_PC,
+ 	[VECI_BUSERR]		=	BUSERR_HANDLER,
+@@ -615,6 +618,18 @@ vec_set_entry(int vec, void *addr)
+ 	KASSERT(vec >= 0);
+ 	KASSERT(vec < NVECTORS);
+ 	vectab[vec] = addr;
++#ifdef MULTIPROCESSOR
++	/* and in the private copies of the other CPUs */
++	{
++		CPU_INFO_ITERATOR cii;
++		struct cpu_info *ci;
++
++		for (CPU_INFO_FOREACH(cii, ci)) {
++			if (ci->ci_vectors != NULL && ci->ci_vectors != vectab)
++				ci->ci_vectors[vec] = addr;
++		}
++	}
++#endif
+ #if defined(M68040) || defined(M68060)
+ 	if (cputype == CPU_68040 || cputype == CPU_68060) {
+ 		DCIS();
+diff --git a/sys/arch/virt68k/conf/GENERIC.MP b/sys/arch/virt68k/conf/GENERIC.MP
+new file mode 100644
+index 000000000..0e267d86c
+--- /dev/null
++++ b/sys/arch/virt68k/conf/GENERIC.MP
+@@ -0,0 +1,7 @@
++# $NetBSD$
++#
++# GENERIC with MULTIPROCESSOR (QEMU virt with -smp N, see virtsmp(4)).
++
++include "arch/virt68k/conf/GENERIC"
++
++options 	MULTIPROCESSOR
+diff --git a/sys/arch/virt68k/conf/files.virt68k b/sys/arch/virt68k/conf/files.virt68k
+index a27a66dbc..55d5d6bf3 100644
+--- a/sys/arch/virt68k/conf/files.virt68k
++++ b/sys/arch/virt68k/conf/files.virt68k
+@@ -39,6 +39,7 @@ file arch/virt68k/virt68k/clock.c
+ file arch/virt68k/virt68k/disksubr.c
+ file arch/virt68k/virt68k/intr.c
+ file arch/virt68k/virt68k/machdep.c
++file arch/virt68k/virt68k/cpu_mp.c		multiprocessor
+ file arch/virt68k/virt68k/pmap_bootstrap.c	compile-with "${NOPROF_C}"
+ file arch/virt68k/virt68k/trap.c
+ file arch/m68k/m68k/cacheops.c
+diff --git a/sys/arch/virt68k/virt68k/cpu_mp.c b/sys/arch/virt68k/virt68k/cpu_mp.c
+new file mode 100644
+index 000000000..0bf906d22
+--- /dev/null
++++ b/sys/arch/virt68k/virt68k/cpu_mp.c
+@@ -0,0 +1,143 @@
++/*	$NetBSD$	*/
++
++/*-
++ * Copyright (c) 2026 The NetBSD Foundation, Inc.
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE NETBSD FOUNDATION, INC. AND CONTRIBUTORS
++ * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
++ * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
++ * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE FOUNDATION OR CONTRIBUTORS
++ * BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++ * POSSIBILITY OF SUCH DAMAGE.
++ */
++
++/*
++ * MULTIPROCESSOR support for virt68k: ASTs, rescheduling and IPIs.
++ * The inter-processor interrupts are provided by virtsmp(4); without it
++ * (a single CPU) there is never another CPU to interrupt.
++ */
++
++#include <sys/cdefs.h>
++__KERNEL_RCSID(0, "$NetBSD$");
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/atomic.h>
++#include <sys/cpu.h>
++#include <sys/ipi.h>
++#include <sys/lwp.h>
++#include <sys/xcall.h>
++
++#include <machine/cpu.h>
++#include <machine/intr.h>
++
++#include <virt68k/virt68k/cpu_mp.h>
++
++/* Set by virtsmp(4) when it attaches. */
++void	(*virt68k_ipi_send)(struct cpu_info *, u_int);
++
++static void
++cpu_send_ipi(struct cpu_info *ci, u_int ipi)
++{
++	KASSERT(ci != curcpu());
++	if (virt68k_ipi_send != NULL)
++		(*virt68k_ipi_send)(ci, ipi);
++}
++
++void
++cpu_set_ast(struct lwp *l)
++{
++	struct cpu_info *ci = l->l_cpu;
++
++	ci->ci_astpending = 1;
++	if (ci != curcpu())
++		cpu_send_ipi(ci, VIRT68K_IPI_AST);
++}
++
++void
++cpu_need_resched(struct cpu_info *ci, struct lwp *l, int flags)
++{
++	/* There is no kernel preemption: always an AST on return. */
++	ci->ci_astpending = 1;
++	if ((flags & RESCHED_REMOTE) != 0)
++		cpu_send_ipi(ci, VIRT68K_IPI_AST);
++}
++
++void
++xc_send_ipi(struct cpu_info *ci)
++{
++	CPU_INFO_ITERATOR cii;
++	struct cpu_info *t;
++
++	if (ci != NULL) {
++		cpu_send_ipi(ci, VIRT68K_IPI_XCALL);
++		return;
++	}
++	for (CPU_INFO_FOREACH(cii, t)) {
++		if (t != curcpu())
++			cpu_send_ipi(t, VIRT68K_IPI_XCALL);
++	}
++}
++
++void
++cpu_ipi(struct cpu_info *ci)
++{
++	CPU_INFO_ITERATOR cii;
++	struct cpu_info *t;
++
++	if (ci != NULL) {
++		cpu_send_ipi(ci, VIRT68K_IPI_GENERIC);
++		return;
++	}
++	for (CPU_INFO_FOREACH(cii, t)) {
++		if (t != curcpu())
++			cpu_send_ipi(t, VIRT68K_IPI_GENERIC);
++	}
++}
++
++/*
++ * Handle the IPIs whose bits are set in "pending", on the current CPU,
++ * at IPL_SCHED.  Called by virtsmp(4).
++ */
++void
++virt68k_ipi_dispatch(u_int pending)
++{
++	if (pending & (1u << VIRT68K_IPI_AST)) {
++		/* curcpu()->ci_astpending was set by the sender */
++	}
++	if (pending & (1u << VIRT68K_IPI_XCALL))
++		xc_ipi_handler();
++	if (pending & (1u << VIRT68K_IPI_GENERIC))
++		ipi_cpu_handler();
++	if (pending & (1u << VIRT68K_IPI_HALT)) {
++		/* XXX tell the boot CPU */
++		for (;;)
++			__asm volatile("stop #0x2700");
++	}
++}
++
++void
++cpu_boot_secondary_processors(void)
++{
++	/* virtsmp(4) starts them; nothing without it */
++	if (virt68k_boot_secondaries != NULL)
++		(*virt68k_boot_secondaries)();
++}
++
++/* Set by virtsmp(4) when it attaches. */
++void	(*virt68k_boot_secondaries)(void);
+diff --git a/sys/arch/virt68k/virt68k/cpu_mp.h b/sys/arch/virt68k/virt68k/cpu_mp.h
+new file mode 100644
+index 000000000..7990bd732
+--- /dev/null
++++ b/sys/arch/virt68k/virt68k/cpu_mp.h
+@@ -0,0 +1,27 @@
++/*	$NetBSD$	*/
++
++/*
++ * MULTIPROCESSOR glue between the virt68k MD code and virtsmp(4).
++ * (Same license as cpu_mp.c.)
++ */
++
++#ifndef _VIRT68K_CPU_MP_H_
++#define _VIRT68K_CPU_MP_H_
++
++#ifdef _KERNEL
++/* IPI reasons: bit numbers in the virt-smp IPI_PENDING register */
++#define	VIRT68K_IPI_NOP		0
++#define	VIRT68K_IPI_AST		1
++#define	VIRT68K_IPI_XCALL	2
++#define	VIRT68K_IPI_GENERIC	3
++#define	VIRT68K_IPI_HALT	4
++#define	VIRT68K_IPI_DDB		5
++
++struct cpu_info;
++
++extern void	(*virt68k_ipi_send)(struct cpu_info *, u_int);
++extern void	(*virt68k_boot_secondaries)(void);
++void	virt68k_ipi_dispatch(u_int);
++#endif
++
++#endif /* _VIRT68K_CPU_MP_H_ */
+diff --git a/sys/arch/virt68k/virt68k/genassym.cf b/sys/arch/virt68k/virt68k/genassym.cf
+index 1756394c3..4351a234d 100644
+--- a/sys/arch/virt68k/virt68k/genassym.cf
++++ b/sys/arch/virt68k/virt68k/genassym.cf
+@@ -101,6 +101,14 @@ define	P_VMSPACE		offsetof(struct proc, p_vmspace)
+ 
+ # interrupt/fault metering
+ define	CI_NINTR		offsetof(struct cpu_info, ci_data.cpu_nintr)
++define	CI_IDEPTH		offsetof(struct cpu_info, ci_idepth)
++ifdef MULTIPROCESSOR
++define	CI_CURLWP		offsetof(struct cpu_info, ci_curlwp)
++define	CI_CURPCB		offsetof(struct cpu_info, ci_curpcb)
++define	CI_ASTPENDING		offsetof(struct cpu_info, ci_astpending)
++define	CI_TMPSTK		offsetof(struct cpu_info, ci_tmpstk)
++define	VB_CI			offsetof(struct m68k_vecblk, vb_ci)
++endif
+ 
+ # PSL values (should just include psl.h?)
+ define	PSL_S			PSL_S
+diff --git a/sys/arch/virt68k/virt68k/intr.c b/sys/arch/virt68k/virt68k/intr.c
+index 2b3f7cd7b..0b2b2af80 100644
+--- a/sys/arch/virt68k/virt68k/intr.c
++++ b/sys/arch/virt68k/virt68k/intr.c
+@@ -131,7 +131,9 @@ __CTASSERT(__arraycount(intr_evcnt) == NIRQ);
+ #define	IRQ_TO_IPL(x)	 ((IRQ_TO_IHLIST(x) >> 5) + 1)
+ static LIST_HEAD(intrhand_list, intrhand) intrhands[IHLIST_COUNT];
+ 
++#ifndef MULTIPROCESSOR		/* else ci_idepth */
+ volatile unsigned int	intr_depth;	/* used in locore.s */
++#endif
+ 
+ static struct gfpic_softc *pics[NPIC];
+ 
+diff --git a/sys/arch/virt68k/virt68k/locore.s b/sys/arch/virt68k/virt68k/locore.s
+index fe0ff6872..d6aff70be 100644
+--- a/sys/arch/virt68k/virt68k/locore.s
++++ b/sys/arch/virt68k/virt68k/locore.s
+@@ -45,6 +45,7 @@
+ #include "opt_kgdb.h"
+ #include "opt_lockdebug.h"
+ #include "opt_m68k_arch.h"
++#include "opt_multiprocessor.h"
+ 
+ #include "assym.h"
+ #include <machine/asm.h>
+@@ -110,6 +111,15 @@ ASENTRY_NOPROFILE(start)
+ 1:	clrl	%a0@+
+ 	dbra	%d0,1b
+ 
++#ifdef MULTIPROCESSOR
++	/*
++	 * curcpu() is found through the VBR: point it at the boot CPU's
++	 * vector block right away (the kernel runs at VA == PA).
++	 */
++	RELOC(vectab,%a0)
++	movc	%a0,%vbr
++#endif
++
+ 	/* XXX XXX XXX */
+ 	movl	#CACHE_OFF,%d0
+ 	movc	%d0,%cacr		| clear and disable on-chip cache(s)
+@@ -214,6 +224,10 @@ Lmmuenabled:
+  */
+ 	lea	_ASM_LABEL(tmpstk),%sp	| re-load the temporary stack
+ 	jbsr	_C_LABEL(vec_init)	| initialize the vector table
++#ifdef MULTIPROCESSOR
++	GETCURCPU(%a0)			| tmpstk is the boot CPU's
++	movl	%sp,%a0@(CI_TMPSTK)	|   scratch stack
++#endif
+ /* call final pmap setup */
+ 	jbsr	_C_LABEL(pmap_bootstrap_finalize)
+ /* set kernel stack, user SP */
+@@ -321,7 +335,7 @@ ENTRY_NOPROFILE(fpfault)
+ 	movl	%usp,%a0	| and save
+ 	movl	%a0,%sp@(FR_SP)	|   the user stack pointer
+ 	clrl	%sp@-		| no VA arg
+-	movl	_C_LABEL(curpcb),%a0 | current pcb
++	GETCURPCB(%a0)		| current pcb
+ 	lea	%a0@(PCB_FPCTX),%a0 | address of FP savearea
+ 	fsave	%a0@		| save state
+ #if defined(M68040) || defined(M68060)
+@@ -364,7 +378,12 @@ ENTRY_NOPROFILE(trap0)
+ 	movl	%d0,%sp@-		| push syscall number
+ 	jbsr	_C_LABEL(syscall)	| handle it
+ 	addql	#4,%sp			| pop syscall arg
++#ifdef MULTIPROCESSOR
++	GETCURCPU(%a0)			| (a0 is restored below)
++	tstl	%a0@(CI_ASTPENDING)	| AST pending?
++#else
+ 	tstl	_C_LABEL(astpending)	| AST pending?
++#endif
+ 	jne	Lrei1			| Yup, go deal with it.
+ 	movl	%sp@(FR_SP),%a0		| grab and restore
+ 	movl	%a0,%usp		|   user SP
+@@ -378,7 +397,7 @@ ENTRY_NOPROFILE(trap0)
+  * command in d0, addr in a1, length in d1
+  */
+ ENTRY_NOPROFILE(trap12)
+-	movl	_C_LABEL(curlwp),%a0
++	GETCURLWP(%a0)
+ 	movl	%a0@(L_PROC),%sp@-	| push current proc pointer
+ 	movl	%d1,%sp@-		| push length
+ 	movl	%a1,%sp@-		| push addr
+@@ -498,11 +517,21 @@ Lbrkpt3:
+  */
+ 
+ ENTRY_NOPROFILE(intrhand_autovec)
++#ifdef MULTIPROCESSOR
++	INTERRUPT_SAVEREG
++	GETCURCPU(%a0)
++	addql	#1,%a0@(CI_IDEPTH)
++	jbsr	_C_LABEL(intr_dispatch)	| call dispatcher
++	GETCURCPU(%a0)
++	subql	#1,%a0@(CI_IDEPTH)
++	INTERRUPT_RESTOREREG
++#else
+ 	addql	#1,_C_LABEL(intr_depth)
+ 	INTERRUPT_SAVEREG
+ 	jbsr	_C_LABEL(intr_dispatch)	| call dispatcher
+ 	INTERRUPT_RESTOREREG
+ 	subql	#1,_C_LABEL(intr_depth)
++#endif
+ 
+ 	/* FALLTHROUGH to rei */
+ 
+@@ -518,7 +547,14 @@ ENTRY_NOPROFILE(intrhand_autovec)
+  * necessitating a stack cleanup.
+  */
+ ASENTRY_NOPROFILE(rei)
++#ifdef MULTIPROCESSOR
++	movl	%a0,%sp@-		| all registers are live here
++	GETCURCPU(%a0)
++	tstl	%a0@(CI_ASTPENDING)	| AST pending?
++	movl	%sp@+,%a0		| (movea does not change the CCR)
++#else
+ 	tstl	_C_LABEL(astpending)	| AST pending?
++#endif
+ 	jeq	Ldorte			| Nope. Just return.
+ 	btst	#5,%sp@			| Returning to kernel mode?
+ 	jne	Ldorte			| Yup. Can't do ASTs
+@@ -566,7 +602,7 @@ Laststkadj:
+ #if defined(M68040) || defined(M68060)
+ ENTRY(suline)
+ 	movl	%sp@(4),%a0		| address to write
+-	movl	_C_LABEL(curpcb),%a1	| current pcb
++	GETCURPCB(%a1)			| current pcb
+ 	movl	#Lslerr,%a1@(PCB_ONFAULT) | where to return to on a fault
+ 	movl	%sp@(8),%a1		| address of line
+ 	movl	%a1@+,%d0		| get lword
+@@ -586,7 +622,7 @@ ENTRY(suline)
+ Lslerr:
+ 	moveq	#-1,%d0
+ Lsldone:
+-	movl	_C_LABEL(curpcb),%a1	| current pcb
++	GETCURPCB(%a1)			| current pcb
+ 	clrl	%a1@(PCB_ONFAULT)	| clear fault address
+ 	rts
+ #endif
+diff --git a/sys/arch/virt68k/virt68k/machdep.c b/sys/arch/virt68k/virt68k/machdep.c
+index 0f5b664d8..e5072a759 100644
+--- a/sys/arch/virt68k/virt68k/machdep.c
++++ b/sys/arch/virt68k/virt68k/machdep.c
+@@ -88,6 +88,7 @@ __KERNEL_RCSID(0, "$NetBSD: machdep.c,v 1.9.4.1 2025/11/21 09:53:25 martin Exp $
+ #include <machine/psl.h>
+ #include <machine/pte.h>
+ #include <machine/vmparam.h>
++#include <machine/vectors.h>
+ #include <m68k/include/cacheops.h>
+ #include <dev/cons.h>
+ #include <dev/mm.h>
+@@ -103,8 +104,17 @@ __KERNEL_RCSID(0, "$NetBSD: machdep.c,v 1.9.4.1 2025/11/21 09:53:25 martin Exp $
+ /* the following is used externally (sysctl_hw) */
+ char	machine[] = MACHINE;	/* from <machine/param.h> */
+ 
++#ifdef MULTIPROCESSOR
++/* The boot CPU; the others are allocated when they attach. */
++struct cpu_info cpu_info_store = {
++	.ci_self = &cpu_info_store,
++	.ci_vectors = vectab,
++};
++struct cpu_info *cpu_info_list = &cpu_info_store;
++#else
+ /* Our exported CPU info; we can have only one. */  
+ struct cpu_info cpu_info_store;
++#endif
+ 
+ struct vm_map *phys_map = NULL;
+ 
+-- 
+2.47.3
+

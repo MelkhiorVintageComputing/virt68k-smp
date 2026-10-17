@@ -1,0 +1,32 @@
+From 1afb81761905710f8f3a9f5175ce534e6314c839 Mon Sep 17 00:00:00 2001
+From: Romain Dolbeau <romain@dolbeau.org>
+Date: Sat, 17 Oct 2026 18:23:54 +0200
+Subject: [PATCH 4/6] standard-headers: m68k: add BI_VIRT_SMP_BASE bootinfo tag
+
+Placeholder for the matching change to the Linux uapi header
+arch/m68k/include/uapi/asm/bootinfo-virt.h, which must go upstream
+first; this patch is then replaced by a headers update.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Romain Dolbeau <romain@dolbeau.org>
+---
+ include/standard-headers/asm-m68k/bootinfo-virt.h | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/include/standard-headers/asm-m68k/bootinfo-virt.h b/include/standard-headers/asm-m68k/bootinfo-virt.h
+index 75ac6bbd7d..4b3ee1086a 100644
+--- a/include/standard-headers/asm-m68k/bootinfo-virt.h
++++ b/include/standard-headers/asm-m68k/bootinfo-virt.h
+@@ -16,6 +16,9 @@
+ /* No longer used -- replaced with BI_RNG_SEED -- but don't reuse this index:
+  * #define BI_VIRT_RNG_SEED	0x8006 */
+ 
++/* virt-smp controller: MMIO base, number of CPUs (only present if > 1) */
++#define BI_VIRT_SMP_BASE	0x8007
++
+ #define VIRT_BOOTI_VERSION	MK_BI_VERSION(2, 0)
+ 
+ #endif /* _UAPI_ASM_M68K_BOOTINFO_MAC_H */
+-- 
+2.47.3
+

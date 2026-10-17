@@ -1,0 +1,785 @@
+From b2e0882fefe910ad2ef0a4a4d926dd27905d7c8a Mon Sep 17 00:00:00 2001
+From: Romain Dolbeau <romain@dolbeau.org>
+Date: Sat, 17 Oct 2026 18:23:55 +0200
+Subject: [PATCH 5/6] hw/misc: add virt-smp, an SMP controller for the m68k
+ virt machine
+
+Add a paravirtual SMP controller for the m68k virt machine: CPU
+identification, secondary CPU start/stop, inter-processor interrupts, a
+timer per CPU, a global nanosecond counter, and per-CPU interrupt
+priority logic with routing of the device interrupt levels to a CPU.
+The programming model is in docs/specs/virt-smp.rst.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Romain Dolbeau <romain@dolbeau.org>
+---
+ MAINTAINERS                |   3 +
+ docs/specs/index.rst       |   1 +
+ docs/specs/virt-smp.rst    |  88 +++++++
+ hw/misc/Kconfig            |   3 +
+ hw/misc/meson.build        |   1 +
+ hw/misc/trace-events       |  10 +
+ hw/misc/virt_smp.c         | 519 +++++++++++++++++++++++++++++++++++++
+ include/hw/misc/virt_smp.h |  51 ++++
+ 8 files changed, 676 insertions(+)
+ create mode 100644 docs/specs/virt-smp.rst
+ create mode 100644 hw/misc/virt_smp.c
+ create mode 100644 include/hw/misc/virt_smp.h
+
+diff --git a/MAINTAINERS b/MAINTAINERS
+index 902db77218..d775e0b228 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -1441,11 +1441,14 @@ F: hw/char/goldfish_tty.c
+ F: hw/intc/goldfish_pic.c
+ F: hw/intc/m68k_irqc.c
+ F: hw/misc/virt_ctrl.c
++F: hw/misc/virt_smp.c
+ F: include/hw/char/goldfish_tty.h
+ F: include/hw/intc/goldfish_pic.h
+ F: include/hw/intc/m68k_irqc.h
+ F: include/hw/misc/virt_ctrl.h
++F: include/hw/misc/virt_smp.h
+ F: docs/specs/virt-ctlr.rst
++F: docs/specs/virt-smp.rst
+ F: tests/functional/m68k/test_tuxrun.py
+ 
+ MicroBlaze Machines
+diff --git a/docs/specs/index.rst b/docs/specs/index.rst
+index b7909a108a..2228c2e7cc 100644
+--- a/docs/specs/index.rst
++++ b/docs/specs/index.rst
+@@ -32,6 +32,7 @@ guest hardware that is specific to QEMU.
+    spdm
+    standard-vga
+    virt-ctlr
++   virt-smp
+    vmcoreinfo
+    vmgenid
+    rapl-msr
+diff --git a/docs/specs/virt-smp.rst b/docs/specs/virt-smp.rst
+new file mode 100644
+index 0000000000..cdc596d5e7
+--- /dev/null
++++ b/docs/specs/virt-smp.rst
+@@ -0,0 +1,88 @@
++.. SPDX-License-Identifier: GPL-2.0-or-later
++
++Virtual SMP Controller
++======================
++
++The ``virt-smp`` device provides multiprocessor support for the m68k
++``virt`` machine, which has no hardware reference implementation. It is
++instantiated only when the machine has more than one CPU (``-smp N``,
++N > 1, at most 16). With a single CPU the machine is unchanged.
++
++It provides CPU identification, secondary CPU start and stop,
++inter-processor interrupts (IPIs), a timer per CPU, a global nanosecond
++counter, and per-CPU interrupt delivery, including the routing of each
++goldfish-pic output level to a selected CPU. It replaces the
++``m68k-irq-controller`` of the single CPU machine.
++
++Discovery
++---------
++
++The ``BI_VIRT_SMP_BASE`` (0x8007) bootinfo record contains the MMIO base
++address of the device and the number of CPUs.
++
++Programming model
++-----------------
++
++The device uses 4 KiB of MMIO space. All registers are 32-bit wide, big
++endian, and must be accessed with aligned 32-bit accesses. CPUs are
++numbered 0 to N-1; CPU 0 is the boot CPU.
++
++Registers in the banked window (0x000-0x0ff) belong to the CPU that does
++the access.
++
++====== ============== ====== ==================================================
++Offset Name           Access Description
++====== ============== ====== ==================================================
++0x000  ID             RO     Number of the accessing CPU
++0x004  NCPUS          RO     Number of CPUs
++0x008  VERSION        RO     1
++0x010  IPI_PENDING    RO     Pending IPI reasons (bits 15..0)
++0x014  IPI_CLEAR      W1C    Clear the IPI reasons written as 1
++0x018  IPI_CONFIG     RW     Bits 2..0: IPL (0: disabled), bits 15..8: vector.
++                             Reset value: IPL 6, vector 0x40
++0x020  TIMER_CTRL     RW     Bit 0: enable, bit 1: periodic. A write
++                             (re)starts the countdown from TIMER_INTERVAL
++0x024  TIMER_INTERVAL RW     Countdown in nanoseconds
++0x028  TIMER_STATUS   RW     Bit 0: expired; write 1 to acknowledge
++0x02c  TIMER_CONFIG   RW     Bits 2..0: IPL (0: disabled), bits 15..8: vector.
++                             Reset value: IPL 6, vector 0x41
++====== ============== ====== ==================================================
++
++Global registers:
++
++=========== ============== ====== =============================================
++Offset      Name           Access Description
++=========== ============== ====== =============================================
++0x100       IPI_SEND       WO     Bits 31..16: reasons, bits 15..0: target CPU
++                                  mask. The reasons are ORed into IPI_PENDING
++                                  of each running target CPU
++0x110       DEVIRQ_ROUTE   RW     4 bits per level L (1..7) at bit 4*(L-1):
++                                  the CPU that receives goldfish-pic #L
++                                  (L=1..6) and NMI (L=7). Reset value: 0
++0x120       COUNTER_LO     RO     Nanosecond counter (QEMU_CLOCK_VIRTUAL),
++                                  low 32 bits; latches COUNTER_HI for the
++                                  accessing CPU
++0x124       COUNTER_HI     RO     High 32 bits latched by COUNTER_LO
++0x200+16*n  START_PC(n)    RW     Initial PC of CPU n
++0x204+16*n  START_SP(n)    RW     Initial A7 (interrupt stack) of CPU n
++0x208+16*n  START_ARG(n)   RW     Initial D0 and A0 of CPU n
++0x20c+16*n  CPU_CTRL(n)    RW     Read: 1 if running. Write 1: start CPU n if
++                                  stopped. Write 0: stop CPU n (ignored for
++                                  CPU 0)
++=========== ============== ====== =============================================
++
++A started CPU begins in its reset state (supervisor mode, IPL 7, MMU off,
++VBR 0) with the PC, A7, D0 and A0 given above. Its per-CPU registers are
++reset when it is started or stopped. A stopped CPU does not execute and
++takes no interrupt; IPIs sent to it are discarded. Starting a CPU is
++asynchronous: the guest must use its own handshake to know when the new
++CPU runs. A machine reset stops all CPUs except CPU 0.
++
++Interrupt delivery
++------------------
++
++Each CPU is interrupted at the highest level among: the goldfish-pic
++outputs routed to it (autovectored), its IPI and its timer (using the
++vectors of IPI_CONFIG and TIMER_CONFIG). At equal levels the IPI has the
++highest priority, then the timer, then the goldfish-pic. All sources are
++level triggered and stay asserted until acknowledged.
+diff --git a/hw/misc/Kconfig b/hw/misc/Kconfig
+index 1543ee6653..95bc317fed 100644
+--- a/hw/misc/Kconfig
++++ b/hw/misc/Kconfig
+@@ -224,6 +224,9 @@ config SIFIVE_U_PRCI
+ config VIRT_CTRL
+     bool
+ 
++config VIRT_SMP
++    bool
++
+ config LASI
+     bool
+     select LASI_82596
+diff --git a/hw/misc/meson.build b/hw/misc/meson.build
+index 23265f6035..8d10d35551 100644
+--- a/hw/misc/meson.build
++++ b/hw/misc/meson.build
+@@ -26,6 +26,7 @@ system_ss.add(when: 'CONFIG_IOSB', if_true: files('iosb.c'))
+ 
+ # virt devices
+ system_ss.add(when: 'CONFIG_VIRT_CTRL', if_true: files('virt_ctrl.c'))
++system_ss.add(when: 'CONFIG_VIRT_SMP', if_true: files('virt_smp.c'))
+ 
+ # RISC-V devices
+ system_ss.add(when: 'CONFIG_MCHP_PFSOC_DMC', if_true: files('mchp_pfsoc_dmc.c'))
+diff --git a/hw/misc/trace-events b/hw/misc/trace-events
+index c9a868b3ef..be15b229d0 100644
+--- a/hw/misc/trace-events
++++ b/hw/misc/trace-events
+@@ -392,6 +392,16 @@ virt_ctrl_reset(void *dev) "ctrl: %p"
+ virt_ctrl_realize(void *dev) "ctrl: %p"
+ virt_ctrl_instance_init(void *dev) "ctrl: %p"
+ 
++# virt_smp.c
++virt_smp_read(int cpu, uint64_t addr, uint64_t value) "cpu %d reg 0x%03"PRIx64" -> 0x%"PRIx64
++virt_smp_write(int cpu, uint64_t addr, uint64_t value) "cpu %d reg 0x%03"PRIx64" <- 0x%"PRIx64
++virt_smp_update(int cpu, int level, int vector) "cpu %d level %d vector %d"
++virt_smp_ipi(int from, int to, uint32_t reasons) "cpu %d -> cpu %d reasons 0x%04x"
++virt_smp_timer(int cpu) "cpu %d"
++virt_smp_cpu_on(int cpu, uint32_t pc, uint32_t sp, uint32_t arg) "cpu %d pc 0x%08x sp 0x%08x arg 0x%08x"
++virt_smp_cpu_off(int cpu) "cpu %d"
++virt_smp_reset(void) ""
++
+ # lasi.c
+ lasi_chip_mem_valid(uint64_t addr, uint32_t val) "access to addr 0x%"PRIx64" is %d"
+ lasi_chip_read(uint64_t addr, uint32_t val) "addr 0x%"PRIx64" val 0x%08x"
+diff --git a/hw/misc/virt_smp.c b/hw/misc/virt_smp.c
+new file mode 100644
+index 0000000000..ec2ea79e3b
+--- /dev/null
++++ b/hw/misc/virt_smp.c
+@@ -0,0 +1,519 @@
++/*
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * Virt SMP controller (m68k virt machine)
++ *
++ * Provides CPU identification, secondary CPU start/stop, inter-processor
++ * interrupts, per-CPU timers, and per-CPU interrupt priority logic with
++ * routing of the device interrupt levels (goldfish-pic outputs) to a CPU.
++ * See docs/specs/virt-smp.rst for the programming model.
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/log.h"
++#include "qemu/main-loop.h"
++#include "qapi/error.h"
++#include "hw/core/cpu.h"
++#include "hw/core/nmi.h"
++#include "hw/core/qdev-properties.h"
++#include "hw/misc/virt_smp.h"
++#include "migration/vmstate.h"
++#include "system/cpus.h"
++#include "target/m68k/cpu.h"
++#include "trace.h"
++
++enum {
++    /* banked */
++    REG_ID              = 0x000,
++    REG_NCPUS           = 0x004,
++    REG_VERSION         = 0x008,
++    REG_IPI_PENDING     = 0x010,
++    REG_IPI_CLEAR       = 0x014,
++    REG_IPI_CONFIG      = 0x018,
++    REG_TIMER_CTRL      = 0x020,
++    REG_TIMER_INTERVAL  = 0x024,
++    REG_TIMER_STATUS    = 0x028,
++    REG_TIMER_CONFIG    = 0x02c,
++    /* global */
++    REG_IPI_SEND        = 0x100,
++    REG_DEVIRQ_ROUTE    = 0x110,
++    REG_COUNTER_LO      = 0x120,
++    REG_COUNTER_HI      = 0x124,
++    REG_CPU_BASE        = 0x200,
++};
++
++enum {
++    CPU_START_PC    = 0x0,
++    CPU_START_SP    = 0x4,
++    CPU_START_ARG   = 0x8,
++    CPU_CTRL        = 0xc,
++};
++
++#define VIRT_SMP_VERSION        1
++
++#define TIMER_CTRL_ENABLE       (1 << 0)
++#define TIMER_CTRL_PERIODIC     (1 << 1)
++#define TIMER_STATUS_EXPIRED    (1 << 0)
++
++#define CONFIG_IPL(c)           ((c) & 7)
++#define CONFIG_VECTOR(c)        (((c) >> 8) & 0xff)
++#define CONFIG_MASK             0xff07
++#define IPI_CONFIG_RESET        ((0x40 << 8) | 6)
++#define TIMER_CONFIG_RESET      ((0x41 << 8) | 6)
++
++#define AUTOVECTOR_BASE         24
++
++static int virt_smp_current_cpu(VirtSMPState *s)
++{
++    if (current_cpu && current_cpu->cpu_index < s->num_cpus) {
++        return current_cpu->cpu_index;
++    }
++    return 0;
++}
++
++static int virt_smp_route(VirtSMPState *s, int level)
++{
++    int n = extract32(s->devirq_route, 4 * (level - 1), 4);
++
++    return n < s->num_cpus ? n : 0;
++}
++
++/* Recompute the interrupt level and vector presented to CPU n. */
++static void virt_smp_update(VirtSMPState *s, int n)
++{
++    VirtSMPCPUState *c = &s->cpu[n];
++    M68kCPU *cpu = M68K_CPU(qemu_get_cpu(n));
++    int level = 0, vector = 0, l;
++
++    if (c->running) {
++        /* lowest priority first, so that higher priorities override */
++        for (l = 1; l <= VIRT_SMP_NUM_LEVELS; l++) {
++            if ((s->dev_ipr & (1 << (l - 1))) && virt_smp_route(s, l) == n) {
++                level = l;
++                vector = AUTOVECTOR_BASE + l;
++            }
++        }
++        l = CONFIG_IPL(c->timer_config);
++        if ((c->timer_status & TIMER_STATUS_EXPIRED) && l && l >= level) {
++            level = l;
++            vector = CONFIG_VECTOR(c->timer_config);
++        }
++        l = CONFIG_IPL(c->ipi_config);
++        if (c->ipi_pending && l && l >= level) {
++            level = l;
++            vector = CONFIG_VECTOR(c->ipi_config);
++        }
++    }
++    trace_virt_smp_update(n, level, vector);
++    m68k_set_irq_level(cpu, level, vector);
++}
++
++static void virt_smp_update_all(VirtSMPState *s)
++{
++    int n;
++
++    for (n = 0; n < s->num_cpus; n++) {
++        virt_smp_update(s, n);
++    }
++}
++
++static void virt_smp_set_irq(void *opaque, int irq, int level)
++{
++    VirtSMPState *s = opaque;
++    int l = irq + 1;
++
++    if (level) {
++        s->dev_ipr |= 1 << irq;
++    } else {
++        s->dev_ipr &= ~(1 << irq);
++    }
++    virt_smp_update(s, virt_smp_route(s, l));
++}
++
++/* ---- per-CPU timer ---- */
++
++static void virt_smp_timer_arm(VirtSMPCPUState *c, int64_t now)
++{
++    if ((c->timer_ctrl & TIMER_CTRL_ENABLE) && c->timer_interval) {
++        c->timer_deadline = now + c->timer_interval;
++        timer_mod(c->timer, c->timer_deadline);
++    } else {
++        timer_del(c->timer);
++    }
++}
++
++static void virt_smp_timer_cb(void *opaque)
++{
++    VirtSMPCPUState *c = opaque;
++    VirtSMPState *s = c->s;
++    int n = c - s->cpu;
++    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++
++    c->timer_status |= TIMER_STATUS_EXPIRED;
++    if (c->timer_ctrl & TIMER_CTRL_PERIODIC) {
++        /* next period, without accumulating drift, skipping missed ones */
++        do {
++            c->timer_deadline += c->timer_interval;
++        } while (c->timer_deadline <= now);
++        timer_mod(c->timer, c->timer_deadline);
++    } else {
++        c->timer_ctrl &= ~TIMER_CTRL_ENABLE;
++    }
++    trace_virt_smp_timer(n);
++    virt_smp_update(s, n);
++}
++
++/* ---- CPU start / stop ---- */
++
++static void virt_smp_reset_cpu_state(VirtSMPCPUState *c)
++{
++    timer_del(c->timer);
++    c->ipi_pending = 0;
++    c->ipi_config = IPI_CONFIG_RESET;
++    c->timer_ctrl = 0;
++    c->timer_interval = 0;
++    c->timer_status = 0;
++    c->timer_config = TIMER_CONFIG_RESET;
++    c->counter_hi = 0;
++}
++
++static void virt_smp_cpu_on_work(CPUState *cs, run_on_cpu_data data)
++{
++    VirtSMPCPUState *c = data.host_ptr;
++    VirtSMPState *s = c->s;
++    CPUM68KState *env = cpu_env(cs);
++
++    assert(bql_locked());
++    cpu_reset(cs);
++    env->aregs[7] = c->start_sp;
++    env->dregs[0] = c->start_arg;
++    env->aregs[0] = c->start_arg;
++    env->pc = c->start_pc;
++    cs->halted = 0;
++    /* cpu_reset() cleared the pending interrupt state of the CPU */
++    virt_smp_update(s, cs->cpu_index);
++}
++
++static void virt_smp_cpu_off_work(CPUState *cs, run_on_cpu_data data)
++{
++    assert(bql_locked());
++    cs->halted = 1;
++    cs->exception_index = EXCP_HLT;
++}
++
++static void virt_smp_cpu_ctrl(VirtSMPState *s, int n, uint32_t value)
++{
++    VirtSMPCPUState *c = &s->cpu[n];
++    CPUState *cs = qemu_get_cpu(n);
++
++    if (value & 1) {
++        if (c->running) {
++            return;
++        }
++        trace_virt_smp_cpu_on(n, c->start_pc, c->start_sp, c->start_arg);
++        virt_smp_reset_cpu_state(c);
++        c->running = 1;
++        async_run_on_cpu(cs, virt_smp_cpu_on_work, RUN_ON_CPU_HOST_PTR(c));
++    } else {
++        if (n == 0 || !c->running) {
++            return;
++        }
++        trace_virt_smp_cpu_off(n);
++        c->running = 0;
++        virt_smp_reset_cpu_state(c);
++        virt_smp_update(s, n);
++        async_run_on_cpu(cs, virt_smp_cpu_off_work, RUN_ON_CPU_NULL);
++        if (cs == current_cpu) {
++            cpu_exit(cs);
++        }
++    }
++}
++
++/* ---- MMIO ---- */
++
++static uint64_t virt_smp_read(void *opaque, hwaddr addr, unsigned size)
++{
++    VirtSMPState *s = opaque;
++    int me = virt_smp_current_cpu(s);
++    VirtSMPCPUState *c = &s->cpu[me];
++    uint64_t value = 0;
++
++    switch (addr) {
++    case REG_ID:
++        value = me;
++        break;
++    case REG_NCPUS:
++        value = s->num_cpus;
++        break;
++    case REG_VERSION:
++        value = VIRT_SMP_VERSION;
++        break;
++    case REG_IPI_PENDING:
++        value = c->ipi_pending;
++        break;
++    case REG_IPI_CONFIG:
++        value = c->ipi_config;
++        break;
++    case REG_TIMER_CTRL:
++        value = c->timer_ctrl;
++        break;
++    case REG_TIMER_INTERVAL:
++        value = c->timer_interval;
++        break;
++    case REG_TIMER_STATUS:
++        value = c->timer_status;
++        break;
++    case REG_TIMER_CONFIG:
++        value = c->timer_config;
++        break;
++    case REG_DEVIRQ_ROUTE:
++        value = s->devirq_route;
++        break;
++    case REG_COUNTER_LO: {
++        uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++        c->counter_hi = now >> 32;
++        value = (uint32_t)now;
++        break;
++    }
++    case REG_COUNTER_HI:
++        value = c->counter_hi;
++        break;
++    default:
++        if (addr >= REG_CPU_BASE &&
++            addr < REG_CPU_BASE + 16 * s->num_cpus) {
++            VirtSMPCPUState *t = &s->cpu[(addr - REG_CPU_BASE) / 16];
++
++            switch (addr & 0xf) {
++            case CPU_START_PC:
++                value = t->start_pc;
++                break;
++            case CPU_START_SP:
++                value = t->start_sp;
++                break;
++            case CPU_START_ARG:
++                value = t->start_arg;
++                break;
++            case CPU_CTRL:
++                value = t->running;
++                break;
++            }
++        }
++        break;
++    }
++    trace_virt_smp_read(me, addr, value);
++    return value;
++}
++
++static void virt_smp_write(void *opaque, hwaddr addr, uint64_t value,
++                           unsigned size)
++{
++    VirtSMPState *s = opaque;
++    int me = virt_smp_current_cpu(s);
++    VirtSMPCPUState *c = &s->cpu[me];
++    int n;
++
++    trace_virt_smp_write(me, addr, value);
++    switch (addr) {
++    case REG_IPI_CLEAR:
++        c->ipi_pending &= ~value;
++        virt_smp_update(s, me);
++        break;
++    case REG_IPI_CONFIG:
++        c->ipi_config = value & CONFIG_MASK;
++        virt_smp_update(s, me);
++        break;
++    case REG_TIMER_CTRL:
++        c->timer_ctrl = value & (TIMER_CTRL_ENABLE | TIMER_CTRL_PERIODIC);
++        virt_smp_timer_arm(c, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
++        break;
++    case REG_TIMER_INTERVAL:
++        c->timer_interval = value;
++        break;
++    case REG_TIMER_STATUS:
++        c->timer_status &= ~(value & TIMER_STATUS_EXPIRED);
++        virt_smp_update(s, me);
++        break;
++    case REG_TIMER_CONFIG:
++        c->timer_config = value & CONFIG_MASK;
++        virt_smp_update(s, me);
++        break;
++    case REG_IPI_SEND:
++        for (n = 0; n < s->num_cpus; n++) {
++            if ((value & (1 << n)) && s->cpu[n].running) {
++                trace_virt_smp_ipi(me, n, value >> 16);
++                s->cpu[n].ipi_pending |= value >> 16;
++                virt_smp_update(s, n);
++            }
++        }
++        break;
++    case REG_DEVIRQ_ROUTE:
++        s->devirq_route = value & 0x0fffffff;
++        virt_smp_update_all(s);
++        break;
++    default:
++        if (addr >= REG_CPU_BASE &&
++            addr < REG_CPU_BASE + 16 * s->num_cpus) {
++            n = (addr - REG_CPU_BASE) / 16;
++            switch (addr & 0xf) {
++            case CPU_START_PC:
++                s->cpu[n].start_pc = value;
++                break;
++            case CPU_START_SP:
++                s->cpu[n].start_sp = value;
++                break;
++            case CPU_START_ARG:
++                s->cpu[n].start_arg = value;
++                break;
++            case CPU_CTRL:
++                virt_smp_cpu_ctrl(s, n, value);
++                break;
++            }
++        } else {
++            qemu_log_mask(LOG_GUEST_ERROR,
++                          "%s: write to read-only or unknown register 0x%"
++                          HWADDR_PRIx "\n", __func__, addr);
++        }
++        break;
++    }
++}
++
++static const MemoryRegionOps virt_smp_ops = {
++    .read = virt_smp_read,
++    .write = virt_smp_write,
++    .endianness = DEVICE_BIG_ENDIAN,
++    .valid.min_access_size = 4,
++    .valid.max_access_size = 4,
++    .impl.max_access_size = 4,
++};
++
++static void virt_smp_nmi(NMIState *n, int cpu_index, Error **errp)
++{
++    virt_smp_set_irq(n, VIRT_SMP_NUM_LEVELS - 1, 1);
++}
++
++static void virt_smp_reset(DeviceState *dev)
++{
++    VirtSMPState *s = VIRT_SMP(dev);
++    int n;
++
++    trace_virt_smp_reset();
++    s->dev_ipr = 0;
++    s->devirq_route = 0;
++    for (n = 0; n < s->num_cpus; n++) {
++        VirtSMPCPUState *c = &s->cpu[n];
++
++        virt_smp_reset_cpu_state(c);
++        c->running = n == 0;
++        c->start_pc = 0;
++        c->start_sp = 0;
++        c->start_arg = 0;
++    }
++}
++
++static void virt_smp_realize(DeviceState *dev, Error **errp)
++{
++    VirtSMPState *s = VIRT_SMP(dev);
++    int n;
++
++    if (s->num_cpus < 1 || s->num_cpus > VIRT_SMP_MAX_CPUS) {
++        error_setg(errp, "virt-smp: num-cpus must be between 1 and %d",
++                   VIRT_SMP_MAX_CPUS);
++        return;
++    }
++    for (n = 0; n < s->num_cpus; n++) {
++        if (!qemu_get_cpu(n)) {
++            error_setg(errp, "virt-smp: CPU %d does not exist", n);
++            return;
++        }
++        s->cpu[n].s = s;
++        s->cpu[n].timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, virt_smp_timer_cb,
++                                       &s->cpu[n]);
++    }
++}
++
++static void virt_smp_init(Object *obj)
++{
++    VirtSMPState *s = VIRT_SMP(obj);
++
++    memory_region_init_io(&s->iomem, obj, &virt_smp_ops, s, "virt-smp",
++                          0x1000);
++    sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
++    qdev_init_gpio_in(DEVICE(obj), virt_smp_set_irq, VIRT_SMP_NUM_LEVELS);
++}
++
++static int virt_smp_post_load(void *opaque, int version_id)
++{
++    virt_smp_update_all(opaque);
++    return 0;
++}
++
++static const VMStateDescription vmstate_virt_smp_cpu = {
++    .name = "virt-smp-cpu",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_TIMER_PTR(timer, VirtSMPCPUState),
++        VMSTATE_INT64(timer_deadline, VirtSMPCPUState),
++        VMSTATE_UINT32(running, VirtSMPCPUState),
++        VMSTATE_UINT32(ipi_pending, VirtSMPCPUState),
++        VMSTATE_UINT32(ipi_config, VirtSMPCPUState),
++        VMSTATE_UINT32(timer_ctrl, VirtSMPCPUState),
++        VMSTATE_UINT32(timer_interval, VirtSMPCPUState),
++        VMSTATE_UINT32(timer_status, VirtSMPCPUState),
++        VMSTATE_UINT32(timer_config, VirtSMPCPUState),
++        VMSTATE_UINT32(counter_hi, VirtSMPCPUState),
++        VMSTATE_UINT32(start_pc, VirtSMPCPUState),
++        VMSTATE_UINT32(start_sp, VirtSMPCPUState),
++        VMSTATE_UINT32(start_arg, VirtSMPCPUState),
++        VMSTATE_END_OF_LIST()
++    }
++};
++
++static const VMStateDescription vmstate_virt_smp = {
++    .name = "virt-smp",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .post_load = virt_smp_post_load,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32(dev_ipr, VirtSMPState),
++        VMSTATE_UINT32(devirq_route, VirtSMPState),
++        VMSTATE_STRUCT_ARRAY(cpu, VirtSMPState, VIRT_SMP_MAX_CPUS, 1,
++                             vmstate_virt_smp_cpu, VirtSMPCPUState),
++        VMSTATE_END_OF_LIST()
++    }
++};
++
++static const Property virt_smp_properties[] = {
++    DEFINE_PROP_UINT32("num-cpus", VirtSMPState, num_cpus, 1),
++};
++
++static void virt_smp_class_init(ObjectClass *oc, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(oc);
++    NMIClass *nc = NMI_CLASS(oc);
++
++    dc->realize = virt_smp_realize;
++    device_class_set_legacy_reset(dc, virt_smp_reset);
++    device_class_set_props(dc, virt_smp_properties);
++    dc->vmsd = &vmstate_virt_smp;
++    nc->nmi_monitor_handler = virt_smp_nmi;
++}
++
++static const TypeInfo virt_smp_info = {
++    .name = TYPE_VIRT_SMP,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(VirtSMPState),
++    .instance_init = virt_smp_init,
++    .class_init = virt_smp_class_init,
++    .interfaces = (const InterfaceInfo[]) {
++        { TYPE_NMI },
++        { }
++    },
++};
++
++static void virt_smp_register_types(void)
++{
++    type_register_static(&virt_smp_info);
++}
++
++type_init(virt_smp_register_types)
+diff --git a/include/hw/misc/virt_smp.h b/include/hw/misc/virt_smp.h
+new file mode 100644
+index 0000000000..53d8872c3d
+--- /dev/null
++++ b/include/hw/misc/virt_smp.h
+@@ -0,0 +1,51 @@
++/*
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * Virt SMP controller (m68k virt machine)
++ */
++
++#ifndef VIRT_SMP_H
++#define VIRT_SMP_H
++
++#include "hw/core/sysbus.h"
++#include "qemu/timer.h"
++
++#define TYPE_VIRT_SMP "virt-smp"
++OBJECT_DECLARE_SIMPLE_TYPE(VirtSMPState, VIRT_SMP)
++
++#define VIRT_SMP_MAX_CPUS   16
++#define VIRT_SMP_NUM_LEVELS 7   /* device inputs: IPL 1..7 */
++
++typedef struct VirtSMPState VirtSMPState;
++
++typedef struct VirtSMPCPUState {
++    VirtSMPState *s;
++    QEMUTimer *timer;
++    int64_t timer_deadline;
++
++    uint32_t running;
++    uint32_t ipi_pending;
++    uint32_t ipi_config;
++    uint32_t timer_ctrl;
++    uint32_t timer_interval;
++    uint32_t timer_status;
++    uint32_t timer_config;
++    uint32_t counter_hi;
++    uint32_t start_pc;
++    uint32_t start_sp;
++    uint32_t start_arg;
++} VirtSMPCPUState;
++
++struct VirtSMPState {
++    SysBusDevice parent_obj;
++
++    MemoryRegion iomem;
++    uint32_t num_cpus;
++
++    uint32_t dev_ipr;       /* asserted device inputs, bit L-1 for IPL L */
++    uint32_t devirq_route;
++
++    VirtSMPCPUState cpu[VIRT_SMP_MAX_CPUS];
++};
++
++#endif
+-- 
+2.47.3
+
