@@ -132,3 +132,8 @@ The asm helpers in `m68k/include/asm.h` are `GETCURCPU(An)`, `GETCURLWP(An)` and
   - Device interrupts on CPU 0 only.
   - Modules are built without MULTIPROCESSOR (curlwp is unresolved), so they cannot be loaded
     into GENERIC.MP.
+- Soak (`scripts/soak.sh 6 8`, 8 CPUs, our own release image with the fixed libc atomics):
+  6 rounds of parallel `make -j8` plus 8 concurrent file copies, all checksums correct, SOAK PASS.
+  The system time is very high (1017 s sys vs 151 s user for 179 s wall). The suspects are the
+  broadcast TLB shootdowns and kernel-lock pmap serialization; this is the next optimisation
+  target (per-pmap CPU sets for targeted shootdown, batching in pmap_remove, a finer pmap lock).
