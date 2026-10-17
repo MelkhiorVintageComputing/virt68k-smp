@@ -27,6 +27,8 @@ Targets: QEMU 11.1.2 and NetBSD 11.0.
 scripts/build-qemu.sh                                     # builds work/qemu/build/qemu-system-m68k
 scripts/run-baremetal.sh                                  # UP tests, -smp 1, single-threaded TCG
 scripts/run-baremetal.sh -s "1 2 4 8 16" -t "single multi"   # full matrix
+scripts/netbsd-run.py --smp 4 --net --kernel work/obj/sys/arch/virt68k/compile/GENERIC.MP/netbsd \
+    --image images/netbsd-11.0-mp-live.img -c 'dhcpcd -1 -w vioif0' -c 'ping -c 3 10.0.2.2'
 QEMU=work/qemu-stock/build/qemu-system-m68k scripts/run-baremetal.sh 't*'   # stock QEMU
 ```
 

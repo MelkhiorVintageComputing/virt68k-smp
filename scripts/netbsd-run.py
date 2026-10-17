@@ -85,6 +85,8 @@ def main():
     ap.add_argument("--boot-timeout", type=int, default=900)
     ap.add_argument("--cmd-timeout", type=int, default=3600)
     ap.add_argument("--echo", action="store_true")
+    ap.add_argument("--net", action="store_true",
+                    help="add a virtio-net device on QEMU user networking")
     ap.add_argument("-c", "--command", action="append", default=[])
     ap.add_argument("--put", action="append", default=[],
                     help="LOCAL:REMOTE, copy a text file into the guest")
@@ -96,6 +98,9 @@ def main():
             "-kernel", a.kernel, "-append", a.append,
             "-drive", f"file={a.image},format=raw,if=none,id=hd0",
             "-device", "virtio-blk-device,drive=hd0"]
+    if a.net:
+        qemu += ["-netdev", "user,id=n0",
+                 "-device", "virtio-net-device,netdev=n0"]
     c = Console(qemu, a.log, a.echo)
     t0 = time.time()
     try:

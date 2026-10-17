@@ -52,3 +52,18 @@ Memory map (all MMIO in the top 16 MiB):
   panics very early ("MMU fault", bad kernel read at 0x4 in `rw_vector_enter`, before
   the copyright banner). This is a NetBSD-side limit (to be investigated), not related to SMP.
   Use `-m 512M` (the default in `netbsd-run.py`).
+
+## Networking (QEMU built with libslirp 4.8.0)
+
+- `scripts/netbsd-run.py --net` adds `-netdev user,id=n0 -device virtio-net-device,netdev=n0`;
+  NetBSD attaches it as vioif0.
+- Tested with GENERIC (`-smp 1`) and GENERIC.MP (`-smp 4`):
+  - Static config and DHCP (`dhcpcd -1 -w vioif0`) both work: 10.0.2.15, gw 10.0.2.2,
+    DNS 10.0.2.3.
+  - Ping works, and DNS resolves external names.
+  - An HTTP download of the 11.0 kernel (1.7 MB, 3 s) has the right SHA512.
+- HTTPS fails with "certificate verify failed" on a fresh live image: `/etc/openssl/certs` is
+  empty, because the image build does not run `certctl rehash`. After `certctl rehash`,
+  HTTPS works (done once in `images/netbsd-11.0-mp-live.img`).
+- Plain `dhcpcd -w` daemonizes and keeps the console attached, which hangs the scripted console;
+  use `-1` (one shot) in scripts.
