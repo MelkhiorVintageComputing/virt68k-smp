@@ -143,6 +143,21 @@ static inline int set_ipl(int ipl)
 /* stop with the given IPL: sleeps until an interrupt > ipl arrives */
 #define cpu_stop(ipl) __asm__ volatile("stop %0" : : "i"(0x2000 | ((ipl) << 8)) : "memory")
 
+/*
+ * Sleep until "cond" becomes true, without losing wakeups: the condition
+ * is tested at IPL 7, and STOP lowers the IPL to 0 and sleeps in one
+ * step, so an interrupt that changes "cond" cannot slip in between.
+ * Returns at the IPL that was current on entry.
+ */
+#define wait_event(cond) do {                                   \
+        int _ipl = set_ipl(7);                                  \
+        while (!(cond)) {                                       \
+            cpu_stop(0);                                        \
+            set_ipl(7);                                         \
+        }                                                       \
+        set_ipl(_ipl);                                          \
+    } while (0)
+
 static inline int tas(volatile uint8_t *p)  /* returns old bit 7 set? */
 {
     uint8_t r;
