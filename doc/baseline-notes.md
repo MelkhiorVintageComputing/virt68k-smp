@@ -37,3 +37,18 @@ Memory map (all MMIO in the top 16 MiB):
   clearing M) can be lost. Use an atomic OR / cmpxchg on host RAM.
 - `m68k_set_irq_level` (helper.c:943) writes pending_level/vector and calls cpu_interrupt. It is
   called from devices under the BQL, which is fine when there is one irqc per CPU.
+
+## NetBSD 11.0 on QEMU 11.1.2 (stock)
+
+- The official sets were turned into a live image with
+  `distrib/virt68k/liveimage/emuimage` (`nbmake-virt68k live_image`, see
+  `scripts/netbsd-run.py` for how it is booted: `-kernel netbsd -append root=ld0a`,
+  virtio-blk-device).
+- It reaches the login prompt in about 7 s on stock QEMU, and on our QEMU with `-smp 1` and `-smp 4`.
+  With `-smp 4`, the stock kernel prints "mainbus0: unknown bootinfo tag: 0x00008007" and
+  counts it as 1 error while detecting hardware.
+- A self-built GENERIC kernel (build.sh on Linux, gcc 12.5) boots the same image.
+- **Known stock issue**: with 1000M of RAM or more (896M works), the stock kernel on stock QEMU
+  panics very early ("MMU fault", bad kernel read at 0x4 in `rw_vector_enter`, before
+  the copyright banner). This is a NetBSD-side limit (to be investigated), not related to SMP.
+  Use `-m 512M` (the default in `netbsd-run.py`).
