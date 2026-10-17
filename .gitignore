@@ -1,0 +1,7 @@
+# Pristine, add-only inputs: only the manifest is tracked
+/Inputs/*
+!/Inputs/MANIFEST
+# Working trees, builds, images
+/work/
+/images/
+/baremetal/build/
