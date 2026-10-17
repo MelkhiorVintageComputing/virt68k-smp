@@ -85,6 +85,8 @@ def main():
     ap.add_argument("--boot-timeout", type=int, default=900)
     ap.add_argument("--cmd-timeout", type=int, default=3600)
     ap.add_argument("--echo", action="store_true")
+    ap.add_argument("--disk", action="append", default=[],
+                    help="extra raw disk image (ld1, ld2, ...)")
     ap.add_argument("--net", action="store_true",
                     help="add a virtio-net device on QEMU user networking")
     ap.add_argument("-c", "--command", action="append", default=[])
@@ -95,9 +97,15 @@ def main():
     qemu = [a.qemu, "-M", "virt", "-m", a.mem, "-smp", str(a.smp),
             "-accel", f"tcg,thread={a.thread}", "-display", "none",
             "-monitor", "none", "-serial", "stdio",
-            "-kernel", a.kernel, "-append", a.append,
-            "-drive", f"file={a.image},format=raw,if=none,id=hd0",
-            "-device", "virtio-blk-device,drive=hd0"]
+            "-kernel", a.kernel, "-append", a.append]
+    # virtio-mmio slots are used from the top down and NetBSD numbers
+    # the disks by ascending address: create the extra disks first so
+    # that the root disk stays ld0.
+    for i, d in enumerate(a.disk, 1):
+        qemu += ["-drive", f"file={d},format=raw,if=none,id=hd{i}",
+                 "-device", f"virtio-blk-device,drive=hd{i}"]
+    qemu += ["-drive", f"file={a.image},format=raw,if=none,id=hd0",
+             "-device", "virtio-blk-device,drive=hd0"]
     if a.net:
         qemu += ["-netdev", "user,id=n0",
                  "-device", "virtio-net-device,netdev=n0"]
@@ -132,6 +140,7 @@ def main():
                            a.cmd_timeout)
             lines = [l for l in out.decode(errors="replace").split("\n")[:-2]
                      if "__DONE" not in l and "export PS1" not in l
+                     and not l.startswith("stty")
                      and l.strip() not in ("", "#")]
             status = re.search(rb"@@DONE%d([0-9]+)" % i, out).group(1)
             if status != b"0":
