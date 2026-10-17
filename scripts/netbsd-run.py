@@ -86,6 +86,8 @@ def main():
     ap.add_argument("--cmd-timeout", type=int, default=3600)
     ap.add_argument("--echo", action="store_true")
     ap.add_argument("-c", "--command", action="append", default=[])
+    ap.add_argument("--put", action="append", default=[],
+                    help="LOCAL:REMOTE, copy a text file into the guest")
     a = ap.parse_args()
 
     qemu = [a.qemu, "-M", "virt", "-m", a.mem, "-smp", str(a.smp),
@@ -103,6 +105,20 @@ def main():
         c.expect(PROMPT, 120)
         c.send("PS1='# '; export PS1")
         c.expect(PROMPT, 60)
+        c.send("stty -echo")
+        c.expect(PROMPT, 60)
+        for spec in a.put:
+            local, remote = spec.split(":", 1)
+            # typed through the console: "cat" until ^D
+            c.send(f"cat > {remote}")
+            time.sleep(0.5)
+            for line in open(local).read().splitlines():
+                c.send(line)
+                time.sleep(0.01)
+            c.p.stdin.write(b"\x04")
+            c.p.stdin.flush()
+            c.expect(PROMPT, 60)
+            print(f"put {local} -> {remote}", flush=True)
         for i, cmd in enumerate(a.command):
             t1 = time.time()
             # the marker is built by the shell, so its echo cannot match
