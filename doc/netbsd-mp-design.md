@@ -137,3 +137,18 @@ The asm helpers in `m68k/include/asm.h` are `GETCURCPU(An)`, `GETCURLWP(An)` and
   The system time is very high (1017 s sys vs 151 s user for 179 s wall). The suspects are the
   broadcast TLB shootdowns and kernel-lock pmap serialization; this is the next optimisation
   target (per-pmap CPU sets for targeted shootdown, batching in pmap_remove, a finer pmap lock).
+
+## Self-hosting (2026-10-17)
+
+- The sources (`sys`, `common`) go on a second virtio disk (`images/src-disk.img`, 2 GB FFS made
+  with nbmakefs), which shows up as ld1 and is mounted on /usr/src. The procedure is in
+  `scripts/selfhost-kernel.sh`; the kernel is sent back to the host with `nc` over user networking
+  (`scripts/recv-file.py`).
+- GENERIC.MP builds natively in the 8-CPU guest with `make -j8` (768 MB RAM) in 770 s real,
+  2800 s user, 3085 s sys. The resulting kernel boots with 8 CPUs and passes the paging stress and
+  the network test.
+- This found an MP bug: vioif(4) attached before the secondary CPUs, so its per-CPU workqueue
+  was sized for 1 CPU, and `workqueue_wait()` (from `ether_ioctl()`, e.g. when dhcpcd brings the
+  interface up) walked past the allocation. It showed up as a corrupted mutex owner (0x84) without
+  LOCKDEBUG, and as "uninitialized lock" with GENERIC.MP.DEBUG. Fix: virtsmp(4) and the CPUs are
+  now attached first on mainbus.

@@ -1,7 +1,7 @@
 From 6cf1dc916fa530559529f98b3302a315a513f203 Mon Sep 17 00:00:00 2001
 From: Romain Dolbeau <romain@dolbeau.org>
 Date: Sat, 17 Oct 2026 19:37:05 +0200
-Subject: [PATCH 3/3] m68k atomics: make the void
+Subject: [PATCH 3/4] m68k atomics: make the void
  atomic_{add,sub,and,or,xor,inc,dec}_32 MP-safe
 
 They used a single read-modify-write instruction on memory, which is

@@ -5,8 +5,10 @@
 J=${1:-8}; PORT=${2:-}
 set -e
 mkdir -p /usr/src
+fsck -y /dev/rld1c > /dev/null 2>&1 || true
 mount -t ffs /dev/ld1c /usr/src
 cd /usr/src/sys/arch/virt68k/conf
+rm -rf ../compile/GENERIC.MP		# always a full build
 config GENERIC.MP
 cd ../compile/GENERIC.MP
 echo "building with -j$J on $(sysctl -n hw.ncpu) CPUs, $(sysctl -n hw.physmem) bytes"

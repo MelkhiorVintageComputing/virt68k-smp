@@ -90,6 +90,8 @@ def main():
     ap.add_argument("--net", action="store_true",
                     help="add a virtio-net device on QEMU user networking")
     ap.add_argument("-c", "--command", action="append", default=[])
+    ap.add_argument("--ddb", action="append", default=[],
+                    help="ddb command to run if the kernel drops into ddb")
     ap.add_argument("--put", action="append", default=[],
                     help="LOCAL:REMOTE, copy a text file into the guest")
     a = ap.parse_args()
@@ -136,8 +138,21 @@ def main():
             t1 = time.time()
             # the marker is built by the shell, so its echo cannot match
             c.send(f"{cmd}; echo __DONE{i}_$?__ | tr -d _ | sed 's/^/@@/'")
-            out = c.expect(re.compile(rb"\n@@DONE%d([0-9]+)\n" % i),
+            out = c.expect(re.compile(rb"\n@@DONE%d([0-9]+)\n|db\{\d+\}> $" % i),
                            a.cmd_timeout)
+            if re.search(rb"db\{\d+\}> $", out):
+                print("*** kernel entered ddb", flush=True)
+                log = open(a.log, "rb").read().decode(errors="replace")
+                areg = re.findall(r"areg: ((?:[0-9A-F]{8} ?){8})", log)
+                a3 = areg[-1].split()[3] if areg else "0"
+                for dc in a.ddb:
+                    dc = dc.replace("{A3}", "0x" + a3)
+                    c.p.stdin.write((dc + "\r").encode())	# ddb wants CR
+                    c.p.stdin.flush()
+                    o = c.expect(re.compile(rb"db\{\d+\}> $"), 120)
+                    print(f"db> {dc}\n" + o.decode(errors="replace"), flush=True)
+                c.p.kill()
+                return 1
             lines = [l for l in out.decode(errors="replace").split("\n")[:-2]
                      if "__DONE" not in l and "export PS1" not in l
                      and not l.startswith("stty")
