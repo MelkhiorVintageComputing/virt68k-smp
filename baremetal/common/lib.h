@@ -154,12 +154,17 @@ static inline uint32_t cas32(volatile uint32_t *p, uint32_t cmp, uint32_t new)
     __asm__ volatile("casl %0,%2,%1" : "+d"(cmp), "+m"(*p) : "d"(new) : "cc", "memory");
     return cmp;     /* old value */
 }
-static inline void atomic_inc(volatile uint32_t *p)
+static inline uint32_t atomic_add_return(volatile uint32_t *p, uint32_t v)
 {
     uint32_t o = *p, prev;
-    while ((prev = cas32(p, o, o + 1)) != o) {
+    while ((prev = cas32(p, o, o + v)) != o) {
         o = prev;
     }
+    return o + v;
+}
+static inline void atomic_inc(volatile uint32_t *p)
+{
+    atomic_add_return(p, 1);
 }
 
 typedef struct { volatile uint8_t v; } spinlock_t;

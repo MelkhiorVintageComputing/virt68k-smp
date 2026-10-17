@@ -9,7 +9,7 @@ LDFLAGS := -nostdlib -static -no-pie -Wl,-T,common/link.ld -Wl,--build-id=none -
 LIBS    := -lgcc
 
 B       := build
-COMMON  := $(B)/crt0.o $(B)/lib.o
+COMMON  := $(B)/crt0.o $(B)/lib.o $(B)/smp.o
 TESTS   := $(patsubst tests/%.c,%,$(wildcard tests/*.c))
 ELFS    := $(addprefix $(B)/,$(addsuffix .elf,$(TESTS)))
 

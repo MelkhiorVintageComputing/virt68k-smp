@@ -344,13 +344,18 @@ void exc_dispatch(struct exc_frame *f, uint32_t *regs)
           vec, EXC_FORMAT(f), (void *)f->pc, f->sr);
 }
 
+void smp_init_boot(void);
+void smp_init_secondary(int cpu);
+
 void cpu_main(int cpu)
 {
     if (cpu == 0) {
         bootinfo_parse();
+        smp_init_boot();
         main();
         test_done();
     }
+    smp_init_secondary(cpu);
     if (secondary_main) {
         secondary_main(cpu);
     }
