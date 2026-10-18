@@ -16,9 +16,10 @@ Targets: QEMU 11.1.2 and NetBSD 11.0.
 | `work/{obj,tools,destdir,release}` | NetBSD build.sh output. |
 | `images/` | Kernels and disk images we produce. |
 | `doc/virt-smp-spec.md` | Specification of the paravirtual SMP controller (QEMU's copy: `docs/specs/virt-smp.rst`). |
+| `doc/pmap-perf.md` | MP pmap performance work: tools, design changes, measurements. |
 | `doc/baseline-notes.md` | Notes on the stock QEMU virt machine and its MTTCG readiness. |
 | `baremetal/` | Freestanding UP (`t*`) and SMP (`s*`) test programs. |
-| `scripts/` | `build-qemu.sh`, `run-baremetal.sh`. |
+| `scripts/` | `build-qemu.sh`, `build-kernel.sh`, `run-baremetal.sh`; `netbsd-run.py` (boot, log in, run commands; `--monitor` and `--ddb` for hangs); `qemu-regs.py`; guest-side `soak.sh`, `memstress.c`, `pmap-bench.{sh,c}`, `tlbtest.c`, `selfhost-kernel.sh`. |
 | `patches/qemu/` | `git format-patch` export of the QEMU series. |
 
 ## Quick start

@@ -92,13 +92,16 @@ def main():
     ap.add_argument("-c", "--command", action="append", default=[])
     ap.add_argument("--ddb", action="append", default=[],
                     help="ddb command to run if the kernel drops into ddb")
+    ap.add_argument("--monitor", default=None,
+                    help="UNIX socket path for the QEMU monitor (see qemu-regs.py)")
     ap.add_argument("--put", action="append", default=[],
                     help="LOCAL:REMOTE, copy a text file into the guest")
     a = ap.parse_args()
 
     qemu = [a.qemu, "-M", "virt", "-m", a.mem, "-smp", str(a.smp),
             "-accel", f"tcg,thread={a.thread}", "-display", "none",
-            "-monitor", "none", "-serial", "stdio",
+            "-monitor", f"unix:{a.monitor},server,nowait" if a.monitor
+            else "none", "-serial", "stdio",
             "-kernel", a.kernel, "-append", a.append]
     # virtio-mmio slots are used from the top down and NetBSD numbers
     # the disks by ascending address: create the extra disks first so
@@ -165,6 +168,30 @@ def main():
         c.send("shutdown -p now")
     except (TimeoutError, EOFError) as e:
         print(f"ERROR: {type(e).__name__}: {e} (see {a.log})", flush=True)
+        if isinstance(e, TimeoutError):
+            # ^T: the kernel prints the foreground process and its wchan
+            for _ in range(2):
+                c.p.stdin.write(b"\x14"); c.p.stdin.flush()
+                try:
+                    c.expect(rb"\x00NEVER", 4)
+                except (TimeoutError, EOFError):
+                    pass
+            print("--- console after ^T:\n" +
+                  c.buf.decode(errors="replace")[-1500:], flush=True)
+        if isinstance(e, TimeoutError) and a.ddb:
+            # the console magic of gftty(4) enters ddb
+            c.p.stdin.write(b"+++++"); c.p.stdin.flush()
+            try:
+                c.expect(re.compile(rb"db\{\d+\}> $"), 30)
+                for dc in a.ddb:
+                    c.p.stdin.write((dc + "\r").encode()); c.p.stdin.flush()
+                    o = c.expect(re.compile(rb"db\{\d+\}> $"), 120)
+                    print(f"db> {dc}\n" + o.decode(errors="replace"), flush=True)
+            except (TimeoutError, EOFError):
+                print("(no ddb prompt)", flush=True)
+        if a.monitor and isinstance(e, TimeoutError):
+            subprocess.run([sys.executable, f"{TOP}/scripts/qemu-regs.py",
+                            a.monitor, a.kernel], timeout=120)
         c.p.kill()
         return 1
     rc = c.wait_exit(300)

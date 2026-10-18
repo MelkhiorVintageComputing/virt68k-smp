@@ -127,8 +127,8 @@ The asm helpers in `m68k/include/asm.h` are `GETCURCPU(An)`, `GETCURLWP(An)` and
   - **QEMU**: the M bit was not set on a write after a read, and the U/M updates were non-atomic
     under MTTCG.
 - Known simplifications:
-  - Broadcast TLB shootdown on every invalidation.
-  - Kernel-lock pmap.
+  - Kernel-pmap shootdowns are broadcasts, and the kernel pmap has one spin lock (see
+    doc/pmap-perf.md for the user pmaps, which now have targeted shootdowns and their own locks).
   - Device interrupts on CPU 0 only.
   - Modules are built without MULTIPROCESSOR (curlwp is unresolved), so they cannot be loaded
     into GENERIC.MP.
@@ -152,3 +152,10 @@ The asm helpers in `m68k/include/asm.h` are `GETCURCPU(An)`, `GETCURLWP(An)` and
   interface up) walked past the allocation. It showed up as a corrupted mutex owner (0x84) without
   LOCKDEBUG, and as "uninitialized lock" with GENERIC.MP.DEBUG. Fix: virtsmp(4) and the CPUs are
   now attached first on mainbus.
+
+## pmap performance (2026-10-18)
+
+The kernel lock and the broadcast shootdowns are gone from the pmap. The changes are targeted
+and batched shootdowns, lazy pmap activation, per-pmap locks, and trylock pv walks. On 8 CPUs the
+soak takes 16.6 s instead of 100 s (sys 52 s instead of 633 s), and the self-hosted kernel build
+takes 426 s instead of 770 s. The details, tools and measurements are in doc/pmap-perf.md.
