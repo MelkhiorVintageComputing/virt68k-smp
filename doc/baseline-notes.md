@@ -50,8 +50,22 @@ Memory map (all MMIO in the top 16 MiB):
 - A self-built GENERIC kernel (build.sh on Linux, gcc 12.5) boots the same image.
 - **Known stock issue**: with 1000M of RAM or more (896M works), the stock kernel on stock QEMU
   panics very early ("MMU fault", bad kernel read at 0x4 in `rw_vector_enter`, before
-  the copyright banner). This is a NetBSD-side limit (to be investigated), not related to SMP.
+  the copyright banner). This is a NetBSD-side limit, not related to SMP.
   Use `-m 512M` (the default in `netbsd-run.py`).
+  - Cause: the kernel segment table is sized by `MAXKL2SIZE` (`m68k/include/pmap_motorola.h`).
+    The value 32 gives 4 pages, i.e. 32 level-2 blocks of 32 MB of KVA each, which runs out at
+    about 1 GB of RAM.
+  - Workaround (2026-10-25, not applied to our branches): `#define MAXKL2SIZE 128`. On the
+    pristine 11.0 sources (UP GENERIC, stock QEMU), this boots and passes a memory-touching
+    stress at 896M, 1G, 1.5G, 2G and 3G. With 32, every size from 1G up panics.
+  - Caveats:
+    - `stfree`/`pm_stfree` is a 32-bit bitmap, so blocks 32 and up are not tracked.
+      `pmap_bootstrap` then computes `1U << i` with i >= 32 (harmless on m68k, but undefined
+      in C).
+    - The header is shared by all m68k ports.
+    - `hw.physmem` reads negative from 2G up (use `hw.physmem64`).
+    - Separately, a single process using roughly 150 MB of scattered address space panics with
+      "enter: out of address space", whatever the RAM size (the `MAXUL2SIZE` user limit).
 
 ## Networking (QEMU built with libslirp 4.8.0)
 
