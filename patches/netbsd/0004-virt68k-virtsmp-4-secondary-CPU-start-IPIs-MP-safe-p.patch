@@ -1,7 +1,7 @@
-From 6657e4f78e3fc6efc50641ff7ccc4295f3dc3f0a Mon Sep 17 00:00:00 2001
+From b390d8542c2a7786773638e315b7ca1b3f9185d2 Mon Sep 17 00:00:00 2001
 From: Romain Dolbeau <romain@dolbeau.org>
 Date: Sat, 17 Oct 2026 19:10:53 +0200
-Subject: [PATCH 02/10] virt68k: virtsmp(4), secondary CPU start, IPIs; MP-safe
+Subject: [PATCH 04/10] virt68k: virtsmp(4), secondary CPU start, IPIs; MP-safe
  pmap (steps N2-N5)
 
 - virtsmp(4) attaches from the BI_VIRT_SMP_BASE bootinfo record.  It
@@ -62,10 +62,10 @@ index 90ada6d11..6a4d9ae8b 100644
   * Pmap stuff
   */
 diff --git a/sys/arch/m68k/m68k/pmap_motorola.c b/sys/arch/m68k/m68k/pmap_motorola.c
-index 7967c977a..cecddc33d 100644
+index 320390925..90a02ebe9 100644
 --- a/sys/arch/m68k/m68k/pmap_motorola.c
 +++ b/sys/arch/m68k/m68k/pmap_motorola.c
-@@ -245,6 +245,179 @@ pt_entry_t	*Sysmap, *Sysptmap;
+@@ -248,6 +248,179 @@ pt_entry_t	*Sysmap, *Sysptmap;
  st_entry_t	*Segtabzero, *Segtabzeropa;
  vsize_t		Sysptsize = VM_KERNEL_PT_PAGES;
  
@@ -245,7 +245,7 @@ index 7967c977a..cecddc33d 100644
  static struct pmap kernel_pmap_store;
  struct pmap	*const kernel_pmap_ptr = &kernel_pmap_store;
  struct vm_map	*st_map, *pt_map;
-@@ -289,6 +462,24 @@ u_int		protostfree;	/* prototype (default) free ST map */
+@@ -292,6 +465,24 @@ u_int		protostfree;	/* prototype (default) free ST map */
  pt_entry_t	*caddr1_pte;	/* PTE for CADDR1 */
  pt_entry_t	*caddr2_pte;	/* PTE for CADDR2 */
  
@@ -270,7 +270,7 @@ index 7967c977a..cecddc33d 100644
  struct pool	pmap_pmap_pool;	/* memory pool for pmap structures */
  struct pool	pmap_pv_pool;	/* memory pool for pv entries */
  
-@@ -330,8 +521,13 @@ void pmap_check_wiring(const char *, vaddr_t);
+@@ -333,8 +524,13 @@ void pmap_check_wiring(const char *, vaddr_t);
  #define	PRM_CFLUSH	0x02
  #define	PRM_KEEPPTPAGE	0x04
  
@@ -284,7 +284,7 @@ index 7967c977a..cecddc33d 100644
  
  #define	active_user_pmap(pm) \
  	(curproc && \
-@@ -1488,7 +1684,7 @@ pmap_kenter_pa(vaddr_t va, paddr_t pa, vm_prot_t prot, u_int flags)
+@@ -1492,7 +1688,7 @@ pmap_kenter_pa(vaddr_t va, paddr_t pa, vm_prot_t prot, u_int flags)
  #endif
  
  	*pte = npte;
@@ -293,7 +293,7 @@ index 7967c977a..cecddc33d 100644
  }
  
  void
-@@ -1880,14 +2076,17 @@ pmap_zero_page(paddr_t phys)
+@@ -1885,14 +2081,17 @@ pmap_zero_page(paddr_t phys)
  	}
  #endif
  
@@ -316,7 +316,7 @@ index 7967c977a..cecddc33d 100644
  #endif
  }
  
-@@ -1940,20 +2139,23 @@ pmap_copy_page(paddr_t src, paddr_t dst)
+@@ -1945,20 +2144,23 @@ pmap_copy_page(paddr_t src, paddr_t dst)
  	}
  #endif
  
@@ -349,7 +349,7 @@ index 7967c977a..cecddc33d 100644
  #endif
  }
  
-@@ -2627,7 +2829,11 @@ pmap_enter_ptpage(pmap_t pmap, vaddr_t va, bool can_fail)
+@@ -2632,7 +2834,11 @@ pmap_enter_ptpage(pmap_t pmap, vaddr_t va, bool can_fail)
  	if (pmap == pmap_kernel()) {
  		struct kpt_page *kpt;
  
@@ -361,7 +361,7 @@ index 7967c977a..cecddc33d 100644
  		if ((kpt = kpt_free_list) == NULL) {
  			/*
  			 * No PT pages available.
-@@ -2655,7 +2861,11 @@ pmap_enter_ptpage(pmap_t pmap, vaddr_t va, bool can_fail)
+@@ -2660,7 +2866,11 @@ pmap_enter_ptpage(pmap_t pmap, vaddr_t va, bool can_fail)
  			    ix, Sysptmap[ix], kpt->kpt_va);
  		}
  #endif
@@ -373,7 +373,7 @@ index 7967c977a..cecddc33d 100644
  	} else {
  
  		/*
-@@ -2996,3 +3206,137 @@ kvtop(void *addr)
+@@ -3001,3 +3211,137 @@ kvtop(void *addr)
  {
  	return (int)vtophys((vaddr_t)addr);
  }

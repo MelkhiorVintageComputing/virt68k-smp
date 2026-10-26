@@ -1,7 +1,7 @@
-From 307773ad4045b71abcb5d032d9abd5960a598803 Mon Sep 17 00:00:00 2001
+From 7ceef2af89b7820f8e7632ff05444b9c1fbe279d Mon Sep 17 00:00:00 2001
 From: Romain Dolbeau <romain@dolbeau.org>
 Date: Sun, 18 Oct 2026 12:57:04 +0200
-Subject: [PATCH 07/10] m68k pmap (MULTIPROCESSOR): per-pmap locks instead of
+Subject: [PATCH 09/10] m68k pmap (MULTIPROCESSOR): per-pmap locks instead of
  the kernel lock
 
 - pm_lock (adaptive mutex) for each user pmap; pmap_klock (recursive
@@ -53,10 +53,10 @@ index 1accbe583..a9a8d4800 100644
  };
  
 diff --git a/sys/arch/m68k/m68k/pmap_motorola.c b/sys/arch/m68k/m68k/pmap_motorola.c
-index d99bf8dba..08e14b695 100644
+index 891beb22a..3556b0324 100644
 --- a/sys/arch/m68k/m68k/pmap_motorola.c
 +++ b/sys/arch/m68k/m68k/pmap_motorola.c
-@@ -382,6 +382,9 @@ struct pmap_tlb_batch {
+@@ -385,6 +385,9 @@ struct pmap_tlb_batch {
  	u_int		tb_nva;		/* PMAP_TLB_MAXVA + 1: everything */
  	vaddr_t		tb_va[PMAP_TLB_MAXVA];
  	struct pglist	tb_freeptp;	/* PT pages to free after it */
@@ -66,7 +66,7 @@ index d99bf8dba..08e14b695 100644
  };
  
  static inline void
-@@ -393,6 +396,9 @@ pmap_tlb_batch_begin(struct pmap_tlb_batch *b, bool on)
+@@ -396,6 +399,9 @@ pmap_tlb_batch_begin(struct pmap_tlb_batch *b, bool on)
  	b->tb_targets = 0;
  	b->tb_nva = 0;
  	TAILQ_INIT(&b->tb_freeptp);
@@ -76,7 +76,7 @@ index d99bf8dba..08e14b695 100644
  	l->l_md.md_tlbbatch = on ? b : NULL;
  }
  
-@@ -401,17 +407,37 @@ static void	pmap_tlb_batch_flush(struct pmap_tlb_batch *);
+@@ -404,17 +410,37 @@ static void	pmap_tlb_batch_flush(struct pmap_tlb_batch *);
  static inline void
  pmap_tlb_batch_end(struct pmap_tlb_batch *b)
  {
@@ -123,7 +123,7 @@ index d99bf8dba..08e14b695 100644
  	}
  }
  
-@@ -425,18 +451,24 @@ pmap_free_ptpage(struct vm_page *pg)
+@@ -428,18 +454,24 @@ pmap_free_ptpage(struct vm_page *pg)
  {
  	struct pmap_tlb_batch *b = curlwp->l_md.md_tlbbatch;
  
@@ -158,7 +158,7 @@ index d99bf8dba..08e14b695 100644
  
  static inline uint32_t
  pmap_cpubit(struct cpu_info *ci)
-@@ -605,6 +637,7 @@ pmap_fault_fixup(pmap_t pm, vaddr_t va, int ftype)
+@@ -608,6 +640,7 @@ pmap_fault_fixup(pmap_t pm, vaddr_t va, int ftype)
  #define	pmap_is_referenced	pmap_is_referenced_unlocked
  #define	pmap_is_modified	pmap_is_modified_unlocked
  #define	pmap_destroy		pmap_destroy_unlocked
@@ -166,7 +166,7 @@ index d99bf8dba..08e14b695 100644
  
  static void	pmap_remove(pmap_t, vaddr_t, vaddr_t);
  static void	pmap_page_protect(struct vm_page *, vm_prot_t);
-@@ -618,6 +651,7 @@ static bool	pmap_clear_reference(struct vm_page *);
+@@ -621,6 +654,7 @@ static bool	pmap_clear_reference(struct vm_page *);
  static bool	pmap_is_referenced(struct vm_page *);
  static bool	pmap_is_modified(struct vm_page *);
  static void	pmap_destroy(pmap_t);
@@ -174,7 +174,7 @@ index d99bf8dba..08e14b695 100644
  
  /* Recursive spin lock for the kernel PTEs and PT page lists. */
  static __cpu_simple_lock_t pmap_klock_lock = __SIMPLELOCK_UNLOCKED;
-@@ -651,6 +685,113 @@ pmap_kunlock(int s)
+@@ -654,6 +688,113 @@ pmap_kunlock(int s)
  	splx(s);
  }
  
@@ -288,7 +288,7 @@ index d99bf8dba..08e14b695 100644
  /*
   * TLB shootdown requests.  A CPU has at most one request in flight (it
   * waits for it at splvm): pmap_tlb_req[n] is that of CPU n, and bit n of
-@@ -788,6 +929,8 @@ pmap_tlb_shootdown_ipi(void)
+@@ -791,6 +932,8 @@ pmap_tlb_shootdown_ipi(void)
  }
  #else
  #define	TBIS_LOCAL(va)	TBIS(va)
@@ -297,7 +297,7 @@ index d99bf8dba..08e14b695 100644
  #endif /* MULTIPROCESSOR */
  
  static struct pmap kernel_pmap_store;
-@@ -855,8 +998,30 @@ pt_entry_t	*caddr2_pte;	/* PTE for CADDR2 */
+@@ -858,8 +1001,30 @@ pt_entry_t	*caddr2_pte;	/* PTE for CADDR2 */
  struct pool	pmap_pmap_pool;	/* memory pool for pmap structures */
  struct pool	pmap_pv_pool;	/* memory pool for pv entries */
  
@@ -328,7 +328,7 @@ index d99bf8dba..08e14b695 100644
  
  #define	PAGE_IS_MANAGED(pa)	(pmap_initialized && uvm_pageismanaged(pa))
  
-@@ -1147,8 +1312,14 @@ pmap_init(void)
+@@ -1150,8 +1315,14 @@ pmap_init(void)
  	/*
  	 * Initialize the pv_entry pools.
  	 */
@@ -343,7 +343,7 @@ index d99bf8dba..08e14b695 100644
  
  	/*
  	 * Now that this is done, mark the pages shared with the
-@@ -1276,6 +1447,9 @@ pmap_create(void)
+@@ -1279,6 +1450,9 @@ pmap_create(void)
  	pmap = pool_get(&pmap_pmap_pool, PR_WAITOK);
  	memset(pmap, 0, sizeof(*pmap));
  	pmap_pinit(pmap);
@@ -353,7 +353,7 @@ index d99bf8dba..08e14b695 100644
  	return pmap;
  }
  
-@@ -1329,6 +1503,9 @@ pmap_destroy(pmap_t pmap)
+@@ -1332,6 +1506,9 @@ pmap_destroy(pmap_t pmap)
  		pmap_drop(pmap);
  #endif
  		pmap_release(pmap);
@@ -363,7 +363,7 @@ index d99bf8dba..08e14b695 100644
  		pool_put(&pmap_pmap_pool, pmap);
  	}
  }
-@@ -1353,8 +1530,20 @@ pmap_release(pmap_t pmap)
+@@ -1356,8 +1533,20 @@ pmap_release(pmap_t pmap)
  #endif
  
  	if (pmap->pm_ptab) {
@@ -384,7 +384,7 @@ index d99bf8dba..08e14b695 100644
  		uvm_km_pgremove((vaddr_t)pmap->pm_ptab,
  		    (vaddr_t)pmap->pm_ptab + M68K_MAX_PTSIZE);
  		uvm_km_free(pt_map, (vaddr_t)pmap->pm_ptab,
-@@ -1597,6 +1786,32 @@ pmap_page_protect(struct vm_page *pg, vm_prot_t prot)
+@@ -1600,6 +1789,32 @@ pmap_page_protect(struct vm_page *pg, vm_prot_t prot)
  
  	pvh = pa_to_pvh(pa);
  	pv = &pvh->pvh_first;
@@ -417,7 +417,7 @@ index d99bf8dba..08e14b695 100644
  	s = splvm();
  	while (pv->pv_pmap != NULL) {
  
-@@ -1610,6 +1825,7 @@ pmap_page_protect(struct vm_page *pg, vm_prot_t prot)
+@@ -1613,6 +1828,7 @@ pmap_page_protect(struct vm_page *pg, vm_prot_t prot)
  		    pte, PRM_TFLUSH|PRM_CFLUSH, NULL);
  	}
  	splx(s);
@@ -425,7 +425,7 @@ index d99bf8dba..08e14b695 100644
  }
  
  /*
-@@ -1697,7 +1913,12 @@ pmap_protect(pmap_t pmap, vaddr_t sva, vaddr_t eva, vm_prot_t prot)
+@@ -1700,7 +1916,12 @@ pmap_protect(pmap_t pmap, vaddr_t sva, vaddr_t eva, vm_prot_t prot)
  					ICPP(pa);
  				}
  #endif
@@ -438,7 +438,7 @@ index d99bf8dba..08e14b695 100644
  #ifdef MULTIPROCESSOR
  				__USE(needtflush);
  				if (isro)
-@@ -1840,7 +2061,7 @@ pmap_enter(pmap_t pmap, vaddr_t va, paddr_t pa, vm_prot_t prot, u_int flags)
+@@ -1843,7 +2064,7 @@ pmap_enter(pmap_t pmap, vaddr_t va, paddr_t pa, vm_prot_t prot, u_int flags)
  
  		pvh = pa_to_pvh(pa);
  		pv = &pvh->pvh_first;
@@ -447,7 +447,7 @@ index d99bf8dba..08e14b695 100644
  
  		PMAP_DPRINTF(PDB_ENTER,
  		    ("enter: pv at %p: %lx/%p/%p\n",
-@@ -1870,7 +2091,20 @@ pmap_enter(pmap_t pmap, vaddr_t va, paddr_t pa, vm_prot_t prot, u_int flags)
+@@ -1873,7 +2094,20 @@ pmap_enter(pmap_t pmap, vaddr_t va, paddr_t pa, vm_prot_t prot, u_int flags)
  				npv = opv;
  				opv = NULL;
  			} else {
@@ -468,7 +468,7 @@ index d99bf8dba..08e14b695 100644
  			}
  			KASSERT(npv != NULL);
  			npv->pv_va = va;
-@@ -1940,7 +2174,7 @@ pmap_enter(pmap_t pmap, vaddr_t va, paddr_t pa, vm_prot_t prot, u_int flags)
+@@ -1943,7 +2177,7 @@ pmap_enter(pmap_t pmap, vaddr_t va, paddr_t pa, vm_prot_t prot, u_int flags)
  		else if (flags & VM_PROT_ALL)
  			pvh->pvh_attrs |= PG_U;
  
@@ -477,7 +477,7 @@ index d99bf8dba..08e14b695 100644
  	}
  	/*
  	 * Assumption: if it is not part of our managed memory
-@@ -2014,9 +2248,13 @@ validate:
+@@ -2018,9 +2252,13 @@ validate:
  #endif
  #ifdef MULTIPROCESSOR
  	{
@@ -493,7 +493,7 @@ index d99bf8dba..08e14b695 100644
  		/*
  		 * A valid mapping that loses rights or changes its cache
  		 * mode must be shot down.  (One whose PA changes has been
-@@ -2254,6 +2492,9 @@ pmap_unwire(pmap_t pmap, vaddr_t va)
+@@ -2259,6 +2497,9 @@ pmap_unwire(pmap_t pmap, vaddr_t va)
   *	Extract the physical address associated with the given
   *	pmap/virtual address pair.
   */
@@ -503,7 +503,7 @@ index d99bf8dba..08e14b695 100644
  bool
  pmap_extract(pmap_t pmap, vaddr_t va, paddr_t *pap)
  {
-@@ -2789,8 +3030,12 @@ pmap_remove_mapping(pmap_t pmap, vaddr_t va, pt_entry_t *pte, int flags,
+@@ -2794,8 +3035,12 @@ pmap_remove_mapping(pmap_t pmap, vaddr_t va, pt_entry_t *pte, int flags,
  	 */
  
  	PMAP_DPRINTF(PDB_REMOVE, ("remove: invalidating pte at %p\n", pte));
@@ -516,7 +516,7 @@ index d99bf8dba..08e14b695 100644
  #ifdef MULTIPROCESSOR
  	if (flags & PRM_TFLUSH)
  		pmap_inval(pmap, va);
-@@ -2840,11 +3085,16 @@ pmap_remove_mapping(pmap_t pmap, vaddr_t va, pt_entry_t *pte, int flags,
+@@ -2845,11 +3090,16 @@ pmap_remove_mapping(pmap_t pmap, vaddr_t va, pt_entry_t *pte, int flags,
  				    ptppv->pv_pmap, ptppv->pv_va,
  				    ptppv->pv_next);
  #endif
@@ -534,7 +534,7 @@ index d99bf8dba..08e14b695 100644
  			rw_enter(uvm_kernel_object->vmobjlock, RW_WRITER);
  			uvm_pagefree(PHYS_TO_VM_PAGE(ptppa));
  			rw_exit(uvm_kernel_object->vmobjlock);
-@@ -2870,7 +3120,7 @@ pmap_remove_mapping(pmap_t pmap, vaddr_t va, pt_entry_t *pte, int flags,
+@@ -2875,7 +3125,7 @@ pmap_remove_mapping(pmap_t pmap, vaddr_t va, pt_entry_t *pte, int flags,
  	pvh = pa_to_pvh(pa);
  	pv = &pvh->pvh_first;
  	ste = NULL;
@@ -543,7 +543,7 @@ index d99bf8dba..08e14b695 100644
  
  	/*
  	 * If it is the first entry on the list, it is actually
-@@ -2977,10 +3227,12 @@ pmap_remove_mapping(pmap_t pmap, vaddr_t va, pt_entry_t *pte, int flags,
+@@ -2982,10 +3232,12 @@ pmap_remove_mapping(pmap_t pmap, vaddr_t va, pt_entry_t *pte, int flags,
  				    ("remove: free stab %p\n",
  				    ptpmap->pm_stab));
  #ifdef MULTIPROCESSOR
@@ -558,7 +558,7 @@ index d99bf8dba..08e14b695 100644
  				ptpmap->pm_stab = Segtabzero;
  				ptpmap->pm_stpa = Segtabzeropa;
  #if defined(M68040) || defined(M68060)
-@@ -2995,6 +3247,7 @@ pmap_remove_mapping(pmap_t pmap, vaddr_t va, pt_entry_t *pte, int flags,
+@@ -3000,6 +3252,7 @@ pmap_remove_mapping(pmap_t pmap, vaddr_t va, pt_entry_t *pte, int flags,
  				 */
  #ifdef MULTIPROCESSOR
  				pmap_reload_urp(ptpmap);
@@ -566,7 +566,7 @@ index d99bf8dba..08e14b695 100644
  #else
  				if (active_user_pmap(ptpmap)) {
  					pmap_load_urp((paddr_t)ptpmap->pm_stpa);
-@@ -3011,7 +3264,7 @@ pmap_remove_mapping(pmap_t pmap, vaddr_t va, pt_entry_t *pte, int flags,
+@@ -3016,7 +3269,7 @@ pmap_remove_mapping(pmap_t pmap, vaddr_t va, pt_entry_t *pte, int flags,
  	 */
  
  	pvh->pvh_attrs |= bits;
@@ -575,7 +575,7 @@ index d99bf8dba..08e14b695 100644
  
  	if (opvp != NULL)
  		*opvp = opv;
-@@ -3025,6 +3278,87 @@ pmap_remove_mapping(pmap_t pmap, vaddr_t va, pt_entry_t *pte, int flags,
+@@ -3030,6 +3283,87 @@ pmap_remove_mapping(pmap_t pmap, vaddr_t va, pt_entry_t *pte, int flags,
   *	Test the modified/referenced bits of a physical page.
   */
  /* static */
@@ -663,7 +663,7 @@ index d99bf8dba..08e14b695 100644
  bool
  pmap_testbit(paddr_t pa, int bit)
  {
-@@ -3170,6 +3504,7 @@ pmap_changebit(paddr_t pa, pt_entry_t set, pt_entry_t mask)
+@@ -3175,6 +3509,7 @@ pmap_changebit(paddr_t pa, pt_entry_t set, pt_entry_t mask)
  	splx(s);
  	return r;
  }
@@ -671,7 +671,7 @@ index d99bf8dba..08e14b695 100644
  
  /*
   * pmap_enter_ptpage:
-@@ -3186,6 +3521,10 @@ pmap_enter_ptpage(pmap_t pmap, vaddr_t va, bool can_fail)
+@@ -3191,6 +3526,10 @@ pmap_enter_ptpage(pmap_t pmap, vaddr_t va, bool can_fail)
  	struct pv_entry *pv;
  	st_entry_t *ste;
  	int s;
@@ -682,7 +682,7 @@ index d99bf8dba..08e14b695 100644
  
  	PMAP_DPRINTF(PDB_FOLLOW|PDB_ENTER|PDB_PTPAGE,
  	    ("pmap_enter_ptpage: pmap %p, va %lx\n", pmap, va));
-@@ -3339,6 +3678,20 @@ pmap_enter_ptpage(pmap_t pmap, vaddr_t va, bool can_fail)
+@@ -3344,6 +3683,20 @@ pmap_enter_ptpage(pmap_t pmap, vaddr_t va, bool can_fail)
  		pmap->pm_sref++;
  		PMAP_DPRINTF(PDB_ENTER|PDB_PTPAGE,
  		    ("enter: about to alloc UPT pg at %lx\n", va));
@@ -703,7 +703,7 @@ index d99bf8dba..08e14b695 100644
  		rw_enter(uvm_kernel_object->vmobjlock, RW_WRITER);
  		while ((pg = uvm_pagealloc(uvm_kernel_object,
  					   va - vm_map_min(kernel_map),
-@@ -3352,9 +3705,15 @@ pmap_enter_ptpage(pmap_t pmap, vaddr_t va, bool can_fail)
+@@ -3357,9 +3710,15 @@ pmap_enter_ptpage(pmap_t pmap, vaddr_t va, bool can_fail)
  			rw_enter(uvm_kernel_object->vmobjlock, RW_WRITER);
  		}
  		rw_exit(uvm_kernel_object->vmobjlock);
@@ -719,7 +719,7 @@ index d99bf8dba..08e14b695 100644
  		pmap_enter(pmap_kernel(), va, ptpa,
  		    VM_PROT_READ | VM_PROT_WRITE,
  		    VM_PROT_READ | VM_PROT_WRITE | PMAP_WIRED);
-@@ -3400,7 +3759,7 @@ pmap_enter_ptpage(pmap_t pmap, vaddr_t va, bool can_fail)
+@@ -3405,7 +3764,7 @@ pmap_enter_ptpage(pmap_t pmap, vaddr_t va, bool can_fail)
  	 * the STE when we remove the mapping for the page.
  	 */
  	pvh = pa_to_pvh(ptpa);
@@ -728,7 +728,7 @@ index d99bf8dba..08e14b695 100644
  	if (pvh) {
  		pv = &pvh->pvh_first;
  		pvh->pvh_attrs |= PVH_PTPAGE;
-@@ -3469,7 +3828,11 @@ pmap_enter_ptpage(pmap_t pmap, vaddr_t va, bool can_fail)
+@@ -3474,7 +3833,11 @@ pmap_enter_ptpage(pmap_t pmap, vaddr_t va, bool can_fail)
  		TBIAU();
  #endif
  	pmap->pm_ptpages++;
@@ -741,7 +741,7 @@ index d99bf8dba..08e14b695 100644
  
  	return 0;
  }
-@@ -3484,13 +3847,24 @@ pmap_ptpage_addref(vaddr_t ptpva)
+@@ -3489,13 +3852,24 @@ pmap_ptpage_addref(vaddr_t ptpva)
  {
  	struct vm_page *pg;
  
@@ -766,7 +766,7 @@ index d99bf8dba..08e14b695 100644
  }
  
  /*
-@@ -3504,13 +3878,20 @@ pmap_ptpage_delref(vaddr_t ptpva)
+@@ -3509,13 +3883,20 @@ pmap_ptpage_delref(vaddr_t ptpva)
  	struct vm_page *pg;
  	int rv;
  
@@ -787,7 +787,7 @@ index d99bf8dba..08e14b695 100644
  	return rv;
  }
  
-@@ -3703,64 +4084,139 @@ kvtop(void *addr)
+@@ -3708,64 +4089,139 @@ kvtop(void *addr)
  #undef	pmap_is_referenced
  #undef	pmap_is_modified
  #undef	pmap_destroy
@@ -964,7 +964,7 @@ index d99bf8dba..08e14b695 100644
  	return error;
  }
  
-@@ -3776,89 +4232,102 @@ pmap_kenter_pa(vaddr_t va, paddr_t pa, vm_prot_t prot, u_int flags)
+@@ -3781,89 +4237,102 @@ pmap_kenter_pa(vaddr_t va, paddr_t pa, vm_prot_t prot, u_int flags)
  void
  pmap_kremove(vaddr_t va, vsize_t size)
  {

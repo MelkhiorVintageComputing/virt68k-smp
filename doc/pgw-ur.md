@@ -1,9 +1,13 @@
 # m68k: software wired bit (PG_W) moved from U0 to UR
 
-This is a standalone patch set against the pristine NetBSD 11.0 sources, independent of the
-MULTIPROCESSOR work: `patches/netbsd-pgw-ur/`, from branch `pgw-ur` of `work/netbsd-pgw` (based
-on 2ade45572). The background investigation is in `pg-w-u0-findings.md` (repo root, not
-committed).
+These are the first two patches of the NetBSD series, `patches/netbsd/0001` and `0002`
+(branch `pgw-ur` of `work/netbsd-pgw`, based on the pristine 11.0 import 2ade45572).
+- They are a uniprocessor change on their own: both apply and work on the stock 11.0 tree.
+- They are a prerequisite of the MULTIPROCESSOR patches 0003–0010, which are based on them. On
+  an MP 68040 board, U0/U1 are the snoop-control signals, so the pmap must not use them as
+  software bits.
+
+The background investigation is in `pg-w-u0-findings.md` (repo root, not committed).
 
 ## Why
 
@@ -59,14 +63,15 @@ and 8K pages at run time.
 - `scripts/wiretest.c`: an `mlock`/`munlock` stress with writer threads; checks the data after
   `msync` and the wired count.
 
-## Merged into the MP branch (2026-10-26)
+## Place in the NetBSD series (2026-10-26)
 
-`pgw-ur` is merged into `virt68k-mp`, and the merge was clean. The MP `pmap_unwire()` keeps its
-atomic clear, which now clears bit 11. `patches/netbsd/` now carries the two patches as 0009 and
-0010. The series applies to the pristine tree and reproduces the branch exactly.
+`virt68k-mp` is the pristine import, then these two patches, then the eight MP patches rebased
+on them.
+- The final tree is identical to the earlier one, where `pgw-ur` was merged into the MP branch.
+  The tests of that tree therefore stand.
+- The MP `pmap_unwire()` (patch 0010) clears `PG_W`, now bit 11, with compare-and-swap.
 
-The merged GENERIC.MP passes these tests:
+The merged GENERIC.MP passed these tests:
 - page table scan: no U0/U1 in the kernel tree, and bit 11 on the wired pages;
-- on 8 CPUs: tlbtest, wiretest, `soak.sh 3 8` (16.4 s, as before the merge) and the paging
-  stress;
+- on 8 CPUs: tlbtest, wiretest, `soak.sh 3 8` (16.4 s, as before) and the paging stress;
 - the same tests on GENERIC.MP.DEBUG (LOCKDEBUG).

@@ -1,8 +1,8 @@
 From ebc7a7eb06512da631923628bf9c40e07a97d14c Mon Sep 17 00:00:00 2001
 From: Romain Dolbeau <romain@dolbeau.org>
 Date: Mon, 26 Oct 2026 17:28:08 +0100
-Subject: [PATCH 1/2] m68k: use a user-reserved PTE bit for the software wired
- flag
+Subject: [PATCH 01/10] m68k: use a user-reserved PTE bit for the software
+ wired flag
 
 PG_W was bit 8, which on the 68040/68060 is U0, a "user page attribute"
 bit that the CPU drives on its UPA0 pin for the bus cycles to the page

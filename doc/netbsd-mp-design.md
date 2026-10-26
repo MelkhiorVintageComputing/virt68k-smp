@@ -5,6 +5,10 @@ The target is NetBSD 11.0 on QEMU `virt` with virt-smp (doc/virt-smp-spec.md). T
 
 ## Constraints
 
+- The MP patches are based on the `PG_W` fix (patches/netbsd 0001–0002, doc/pgw-ur.md). On an
+  MP 68040 board U0/U1 drive the snoop-control signals, so the pmap's software wired bit must not
+  be U0.
+
 - `sys/arch/m68k` is shared by every m68k port. All MP changes are behind `#ifdef MULTIPROCESSOR`
   (a `defflag` in `opt_multiprocessor.h`), and only virt68k enables it. Kernels built without
   MULTIPROCESSOR must stay byte-for-byte the same in behaviour.

@@ -1,7 +1,7 @@
-From 23a5191e049a4bd14ed1ccfbe763e528f1f8a40b Mon Sep 17 00:00:00 2001
+From 8465f70403148f6ad4305c195d13910e1548dc83 Mon Sep 17 00:00:00 2001
 From: Romain Dolbeau <romain@dolbeau.org>
 Date: Sun, 18 Oct 2026 09:55:57 +0200
-Subject: [PATCH 05/10] m68k pmap (MULTIPROCESSOR): targeted and batched TLB
+Subject: [PATCH 07/10] m68k pmap (MULTIPROCESSOR): targeted and batched TLB
  shootdowns
 
 - Statistics: per-CPU pmap event counters (vmstat -e, "pmap cpuN"),
@@ -102,10 +102,10 @@ index 7e530c205..c26327ff8 100644
  
  /* md_flags */
 diff --git a/sys/arch/m68k/m68k/pmap_motorola.c b/sys/arch/m68k/m68k/pmap_motorola.c
-index 7f414a38a..e97f8af96 100644
+index 15b95c1c2..cef428bfa 100644
 --- a/sys/arch/m68k/m68k/pmap_motorola.c
 +++ b/sys/arch/m68k/m68k/pmap_motorola.c
-@@ -264,11 +264,81 @@ vsize_t		Sysptsize = VM_KERNEL_PT_PAGES;
+@@ -267,11 +267,81 @@ vsize_t		Sysptsize = VM_KERNEL_PT_PAGES;
   *
   * This favours correctness over speed.
   */
@@ -187,7 +187,7 @@ index 7f414a38a..e97f8af96 100644
  
  static void
  pmap_tbis_local(vaddr_t va)
-@@ -282,17 +352,211 @@ pmap_tbia_local(void)
+@@ -285,17 +355,211 @@ pmap_tbia_local(void)
  	TBIA();
  }
  
@@ -404,7 +404,7 @@ index 7f414a38a..e97f8af96 100644
  	} while (/*CONSTCOND*/0)
  #define	TBIAS()		TBIA()
  #define	TBIAU()		TBIA()
-@@ -356,65 +620,140 @@ pmap_kunlock(int s)
+@@ -359,65 +623,140 @@ pmap_kunlock(int s)
  	splx(s);
  }
  
@@ -582,7 +582,7 @@ index 7f414a38a..e97f8af96 100644
  }
  #else
  #define	TBIS_LOCAL(va)	TBIS(va)
-@@ -955,6 +1294,9 @@ pmap_destroy(pmap_t pmap)
+@@ -958,6 +1297,9 @@ pmap_destroy(pmap_t pmap)
  
  	count = atomic_dec_uint_nv(&pmap->pm_count);
  	if (count == 0) {
@@ -592,7 +592,7 @@ index 7f414a38a..e97f8af96 100644
  		pmap_release(pmap);
  		pool_put(&pmap_pmap_pool, pmap);
  	}
-@@ -1027,9 +1369,39 @@ pmap_activate(struct lwp *l)
+@@ -1030,9 +1372,39 @@ pmap_activate(struct lwp *l)
  	 * Because the kernel has a separate root pointer, we don't
  	 * need to activate the kernel pmap.
  	 */
@@ -632,7 +632,7 @@ index 7f414a38a..e97f8af96 100644
  }
  
  /*
-@@ -1295,8 +1667,16 @@ pmap_protect(pmap_t pmap, vaddr_t sva, vaddr_t eva, vm_prot_t prot)
+@@ -1298,8 +1670,16 @@ pmap_protect(pmap_t pmap, vaddr_t sva, vaddr_t eva, vm_prot_t prot)
  				}
  #endif
  				pmap_pte_set_prot(pte, isro);
@@ -649,7 +649,7 @@ index 7f414a38a..e97f8af96 100644
  				firstpage = false;
  			}
  			pte++;
-@@ -1601,9 +1981,30 @@ validate:
+@@ -1605,9 +1985,30 @@ validate:
  		ICPP(pa);
  	}
  #endif
@@ -680,7 +680,7 @@ index 7f414a38a..e97f8af96 100644
  #ifdef CACHE_HAVE_VAC
  	/*
  	 * The following is executed if we are entering a second
-@@ -2359,8 +2760,13 @@ pmap_remove_mapping(pmap_t pmap, vaddr_t va, pt_entry_t *pte, int flags,
+@@ -2364,8 +2765,13 @@ pmap_remove_mapping(pmap_t pmap, vaddr_t va, pt_entry_t *pte, int flags,
  	PMAP_DPRINTF(PDB_REMOVE, ("remove: invalidating pte at %p\n", pte));
  	bits = *pte & (PG_U|PG_M);
  	*pte = PG_NV;
@@ -694,7 +694,7 @@ index 7f414a38a..e97f8af96 100644
  
  	/*
  	 * For user mappings decrement the wiring count on
-@@ -2405,6 +2811,9 @@ pmap_remove_mapping(pmap_t pmap, vaddr_t va, pt_entry_t *pte, int flags,
+@@ -2410,6 +2816,9 @@ pmap_remove_mapping(pmap_t pmap, vaddr_t va, pt_entry_t *pte, int flags,
  #endif
  			pmap_remove_mapping(pmap_kernel(), ptpva,
  			    NULL, PRM_TFLUSH|PRM_CFLUSH, NULL);
@@ -704,7 +704,7 @@ index 7f414a38a..e97f8af96 100644
  			rw_enter(uvm_kernel_object->vmobjlock, RW_WRITER);
  			uvm_pagefree(PHYS_TO_VM_PAGE(ptppa));
  			rw_exit(uvm_kernel_object->vmobjlock);
-@@ -2535,6 +2944,9 @@ pmap_remove_mapping(pmap_t pmap, vaddr_t va, pt_entry_t *pte, int flags,
+@@ -2540,6 +2949,9 @@ pmap_remove_mapping(pmap_t pmap, vaddr_t va, pt_entry_t *pte, int flags,
  				PMAP_DPRINTF(PDB_REMOVE|PDB_SEGTAB,
  				    ("remove: free stab %p\n",
  				    ptpmap->pm_stab));
@@ -714,7 +714,7 @@ index 7f414a38a..e97f8af96 100644
  				uvm_km_free(st_map, (vaddr_t)ptpmap->pm_stab,
  				    M68K_STSIZE, UVM_KMF_WIRED);
  				ptpmap->pm_stab = Segtabzero;
-@@ -2549,9 +2961,13 @@ pmap_remove_mapping(pmap_t pmap, vaddr_t va, pt_entry_t *pte, int flags,
+@@ -2554,9 +2966,13 @@ pmap_remove_mapping(pmap_t pmap, vaddr_t va, pt_entry_t *pte, int flags,
  				 * Segment table has changed; reload the
  				 * MMU if it's the active user pmap.
  				 */
@@ -728,7 +728,7 @@ index 7f414a38a..e97f8af96 100644
  			}
  		}
  		pvh->pvh_attrs &= ~PVH_PTPAGE;
-@@ -2710,8 +3126,12 @@ pmap_changebit(paddr_t pa, pt_entry_t set, pt_entry_t mask)
+@@ -2715,8 +3131,12 @@ pmap_changebit(paddr_t pa, pt_entry_t set, pt_entry_t mask)
  				}
  #endif
  				*pte = npte;
@@ -741,7 +741,7 @@ index 7f414a38a..e97f8af96 100644
  			}
  		}
  	}
-@@ -2772,9 +3192,13 @@ pmap_enter_ptpage(pmap_t pmap, vaddr_t va, bool can_fail)
+@@ -2777,9 +3197,13 @@ pmap_enter_ptpage(pmap_t pmap, vaddr_t va, bool can_fail)
  		 * Segment table has changed; reload the
  		 * MMU if it's the active user pmap.
  		 */
@@ -755,7 +755,7 @@ index 7f414a38a..e97f8af96 100644
  
  		PMAP_DPRINTF(PDB_ENTER|PDB_PTPAGE|PDB_SEGTAB,
  		    ("enter: pmap %p stab %p(%p)\n",
-@@ -2986,10 +3410,18 @@ pmap_enter_ptpage(pmap_t pmap, vaddr_t va, bool can_fail)
+@@ -2991,10 +3415,18 @@ pmap_enter_ptpage(pmap_t pmap, vaddr_t va, bool can_fail)
  	/*
  	 * Flush stale TLB info.
  	 */
@@ -774,7 +774,7 @@ index 7f414a38a..e97f8af96 100644
  	pmap->pm_ptpages++;
  	splx(s);
  
-@@ -3229,28 +3661,46 @@ kvtop(void *addr)
+@@ -3234,28 +3666,46 @@ kvtop(void *addr)
  #define	PMAP_KLOCK_BEGIN	KERNEL_LOCK(1, NULL)
  #define	PMAP_KLOCK_END		KERNEL_UNLOCK_ONE(NULL)
  
@@ -821,7 +821,7 @@ index 7f414a38a..e97f8af96 100644
  }
  
  int
-@@ -3258,9 +3708,13 @@ pmap_enter(pmap_t pmap, vaddr_t va, paddr_t pa, vm_prot_t prot, u_int flags)
+@@ -3263,9 +3713,13 @@ pmap_enter(pmap_t pmap, vaddr_t va, paddr_t pa, vm_prot_t prot, u_int flags)
  {
  	int error;
  
@@ -835,7 +835,7 @@ index 7f414a38a..e97f8af96 100644
  	return error;
  }
  
-@@ -3276,18 +3730,26 @@ pmap_kenter_pa(vaddr_t va, paddr_t pa, vm_prot_t prot, u_int flags)
+@@ -3281,18 +3735,26 @@ pmap_kenter_pa(vaddr_t va, paddr_t pa, vm_prot_t prot, u_int flags)
  void
  pmap_kremove(vaddr_t va, vsize_t size)
  {
@@ -862,7 +862,7 @@ index 7f414a38a..e97f8af96 100644
  }
  
  bool
-@@ -3295,9 +3757,13 @@ pmap_clear_modify(struct vm_page *pg)
+@@ -3300,9 +3762,13 @@ pmap_clear_modify(struct vm_page *pg)
  {
  	bool rv;
  
@@ -876,7 +876,7 @@ index 7f414a38a..e97f8af96 100644
  	return rv;
  }
  
-@@ -3306,9 +3772,13 @@ pmap_clear_reference(struct vm_page *pg)
+@@ -3311,9 +3777,13 @@ pmap_clear_reference(struct vm_page *pg)
  {
  	bool rv;
  
@@ -890,7 +890,7 @@ index 7f414a38a..e97f8af96 100644
  	return rv;
  }
  
-@@ -3337,8 +3807,12 @@ pmap_is_modified(struct vm_page *pg)
+@@ -3342,8 +3812,12 @@ pmap_is_modified(struct vm_page *pg)
  void
  pmap_destroy(pmap_t pmap)
  {

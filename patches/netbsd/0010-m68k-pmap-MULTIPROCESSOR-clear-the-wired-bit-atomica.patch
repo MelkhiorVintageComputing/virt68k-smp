@@ -1,7 +1,7 @@
-From 08ae173cc6cfa29e637444aae71b9e82716b0b82 Mon Sep 17 00:00:00 2001
+From 9a00c1e13e2f11111c8fd57f7b78b5d6ae56e3d1 Mon Sep 17 00:00:00 2001
 From: Romain Dolbeau <romain@dolbeau.org>
 Date: Sun, 25 Oct 2026 15:52:17 +0100
-Subject: [PATCH 08/10] m68k pmap (MULTIPROCESSOR): clear the wired bit
+Subject: [PATCH 10/10] m68k pmap (MULTIPROCESSOR): clear the wired bit
  atomically in pmap_unwire
 
 pmap_unwire() cleared PG_W with a plain read-modify-write of the PTE;
@@ -13,10 +13,10 @@ lost M bit can lose the contents of a dirty page.  Use pmap_pte_update()
  1 file changed, 5 insertions(+)
 
 diff --git a/sys/arch/m68k/m68k/pmap_motorola.c b/sys/arch/m68k/m68k/pmap_motorola.c
-index 08e14b695..402f54de9 100644
+index 3556b0324..f333ce70b 100644
 --- a/sys/arch/m68k/m68k/pmap_motorola.c
 +++ b/sys/arch/m68k/m68k/pmap_motorola.c
-@@ -2481,7 +2481,12 @@ pmap_unwire(pmap_t pmap, vaddr_t va)
+@@ -2486,7 +2486,12 @@ pmap_unwire(pmap_t pmap, vaddr_t va)
  	 */
  
  	if (pmap_pte_w_chg(pte, 0)) {

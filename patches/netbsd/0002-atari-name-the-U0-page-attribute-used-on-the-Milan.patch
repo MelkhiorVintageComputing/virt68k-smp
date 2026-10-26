@@ -1,7 +1,7 @@
 From bf1df87103ffeab23415db2edab9704a311933ee Mon Sep 17 00:00:00 2001
 From: Romain Dolbeau <romain@dolbeau.org>
 Date: Mon, 26 Oct 2026 17:28:21 +0100
-Subject: [PATCH 2/2] atari: name the U0 page attribute used on the Milan
+Subject: [PATCH 02/10] atari: name the U0 page attribute used on the Milan
 
 The Milan maps the ST I/O area with U0 set, as U0 drives the big-endian
 input of the PLX9080: write it as PTE40_U0 instead of 0x100, now that

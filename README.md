@@ -21,6 +21,7 @@ Targets: QEMU 11.1.2 and NetBSD 11.0.
 | `baremetal/` | Freestanding UP (`t*`) and SMP (`s*`) test programs. |
 | `scripts/` | `build-qemu.sh`, `build-kernel.sh`, `run-baremetal.sh`; `netbsd-run.py` (boot, log in, run commands; `--monitor` and `--ddb` for hangs); `qemu-regs.py`; guest-side `soak.sh`, `memstress.c`, `pmap-bench.{sh,c}`, `tlbtest.c`, `selfhost-kernel.sh`. |
 | `patches/qemu/` | `git format-patch` export of the QEMU series. |
+| `patches/netbsd/` | `git format-patch` export of the NetBSD series (branch `virt68k-mp`, against the 11.0 import). |
 
 ## Quick start
 
@@ -45,3 +46,24 @@ Each test prints `PASS` or `FAIL` and powers the machine off through virt-ctrl. 
 4. standard-headers: add `BI_VIRT_SMP_BASE`. This is a placeholder: the Linux uapi header has to change first.
 5. hw/misc: add the virt-smp device.
 6. hw/m68k/virt: support up to 16 CPUs. With `-smp 1` the machine is unchanged.
+
+## NetBSD series (patches/netbsd)
+
+The series is against the NetBSD 11.0 sources (the pristine import, commit 2ade45572). It applies
+in order with `git am`.
+
+1. m68k: use a user-reserved PTE bit (UR, bit 11) for the software wired flag `PG_W`, instead of
+   U0, which the 68040/060 drive on the UPA0 pin (snoop control on MP boards). This is a UP
+   change, and a prerequisite for MP. See doc/pgw-ur.md.
+2. atari: name the U0 page attribute that the Milan uses (cosmetic).
+3. m68k, virt68k: per-CPU state for MULTIPROCESSOR (step N1).
+4. virt68k: virtsmp(4), secondary CPU start, IPIs, and an MP-safe pmap (steps N2–N5).
+5. m68k atomics: the void `atomic_*_32` operations become CAS loops (MP-safe).
+6. virt68k: attach virtsmp(4), and so the CPUs, before the other devices.
+7. m68k pmap (MP): targeted and batched TLB shootdowns.
+8. m68k pmap (MP): no broadcast shootdowns for user PT pages.
+9. m68k pmap (MP): per-pmap locks instead of the kernel lock.
+10. m68k pmap (MP): clear the wired bit atomically in `pmap_unwire`.
+
+Patches 1–2 work alone on a uniprocessor kernel. 3–10 add MULTIPROCESSOR; see
+doc/netbsd-mp-design.md and doc/pmap-perf.md.
