@@ -1,7 +1,7 @@
 From 23a5191e049a4bd14ed1ccfbe763e528f1f8a40b Mon Sep 17 00:00:00 2001
 From: Romain Dolbeau <romain@dolbeau.org>
 Date: Sun, 18 Oct 2026 09:55:57 +0200
-Subject: [PATCH 5/7] m68k pmap (MULTIPROCESSOR): targeted and batched TLB
+Subject: [PATCH 05/10] m68k pmap (MULTIPROCESSOR): targeted and batched TLB
  shootdowns
 
 - Statistics: per-CPU pmap event counters (vmstat -e, "pmap cpuN"),

@@ -1,7 +1,7 @@
 From 1b4eeba80f553ff509b78235764200ef13d70d88 Mon Sep 17 00:00:00 2001
 From: Romain Dolbeau <romain@dolbeau.org>
 Date: Sat, 17 Oct 2026 21:57:58 +0200
-Subject: [PATCH 4/7] virt68k: attach virtsmp(4), and so the secondary CPUs,
+Subject: [PATCH 04/10] virt68k: attach virtsmp(4), and so the secondary CPUs,
  before all other devices
 
 workqueue(9) (and other MI code) sizes its per-CPU data with ncpu when

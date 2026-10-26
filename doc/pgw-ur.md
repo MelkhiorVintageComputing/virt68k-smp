@@ -58,3 +58,15 @@ and 8K pages at run time.
   `scripts/mlock-hold.c` in the guest, and scans both trees.
 - `scripts/wiretest.c`: an `mlock`/`munlock` stress with writer threads; checks the data after
   `msync` and the wired count.
+
+## Merged into the MP branch (2026-10-26)
+
+`pgw-ur` is merged into `virt68k-mp`, and the merge was clean. The MP `pmap_unwire()` keeps its
+atomic clear, which now clears bit 11. `patches/netbsd/` now carries the two patches as 0009 and
+0010. The series applies to the pristine tree and reproduces the branch exactly.
+
+The merged GENERIC.MP passes these tests:
+- page table scan: no U0/U1 in the kernel tree, and bit 11 on the wired pages;
+- on 8 CPUs: tlbtest, wiretest, `soak.sh 3 8` (16.4 s, as before the merge) and the paging
+  stress;
+- the same tests on GENERIC.MP.DEBUG (LOCKDEBUG).

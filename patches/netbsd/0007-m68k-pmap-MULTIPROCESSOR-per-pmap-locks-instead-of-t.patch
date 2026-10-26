@@ -1,8 +1,8 @@
 From 307773ad4045b71abcb5d032d9abd5960a598803 Mon Sep 17 00:00:00 2001
 From: Romain Dolbeau <romain@dolbeau.org>
 Date: Sun, 18 Oct 2026 12:57:04 +0200
-Subject: [PATCH 7/7] m68k pmap (MULTIPROCESSOR): per-pmap locks instead of the
- kernel lock
+Subject: [PATCH 07/10] m68k pmap (MULTIPROCESSOR): per-pmap locks instead of
+ the kernel lock
 
 - pm_lock (adaptive mutex) for each user pmap; pmap_klock (recursive
   spin lock) for the kernel pmap, which interrupt handlers may change,

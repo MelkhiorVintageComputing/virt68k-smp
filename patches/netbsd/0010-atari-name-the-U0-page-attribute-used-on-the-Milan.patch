@@ -1,0 +1,28 @@
+From bf1df87103ffeab23415db2edab9704a311933ee Mon Sep 17 00:00:00 2001
+From: Romain Dolbeau <romain@dolbeau.org>
+Date: Mon, 26 Oct 2026 17:28:21 +0100
+Subject: [PATCH 10/10] atari: name the U0 page attribute used on the Milan
+
+The Milan maps the ST I/O area with U0 set, as U0 drives the big-endian
+input of the PLX9080: write it as PTE40_U0 instead of 0x100, now that
+PG_W no longer uses that bit.  No functional change.
+---
+ sys/arch/atari/atari/atari_init.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/sys/arch/atari/atari/atari_init.c b/sys/arch/atari/atari/atari_init.c
+index 222dd9731..be1c5ec53 100644
+--- a/sys/arch/atari/atari/atari_init.c
++++ b/sys/arch/atari/atari/atari_init.c
+@@ -969,7 +969,7 @@ map_io_areas(paddr_t ptpa, psize_t ptsize, u_int ptextra)
+ 	 * of the PLX9080. We use this setting so we can read/write the
+ 	 * PLX registers (and PCI-config space) in big-endian mode.
+ 	 */
+-	pg_proto  = STIO_PHYS | PG_RW | PG_CI | PG_V | 0x100;
++	pg_proto  = STIO_PHYS | PG_RW | PG_CI | PG_V | PTE40_U0;
+ #else
+ 	pg_proto  = STIO_PHYS | PG_RW | PG_CI | PG_V;
+ #endif
+-- 
+2.47.3
+
