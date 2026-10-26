@@ -1,7 +1,7 @@
 From b390d8542c2a7786773638e315b7ca1b3f9185d2 Mon Sep 17 00:00:00 2001
 From: Romain Dolbeau <romain@dolbeau.org>
 Date: Sat, 17 Oct 2026 19:10:53 +0200
-Subject: [PATCH 04/10] virt68k: virtsmp(4), secondary CPU start, IPIs; MP-safe
+Subject: [PATCH 04/11] virt68k: virtsmp(4), secondary CPU start, IPIs; MP-safe
  pmap (steps N2-N5)
 
 - virtsmp(4) attaches from the BI_VIRT_SMP_BASE bootinfo record.  It

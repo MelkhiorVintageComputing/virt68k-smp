@@ -1,7 +1,7 @@
 From 7ceef2af89b7820f8e7632ff05444b9c1fbe279d Mon Sep 17 00:00:00 2001
 From: Romain Dolbeau <romain@dolbeau.org>
 Date: Sun, 18 Oct 2026 12:57:04 +0200
-Subject: [PATCH 09/10] m68k pmap (MULTIPROCESSOR): per-pmap locks instead of
+Subject: [PATCH 09/11] m68k pmap (MULTIPROCESSOR): per-pmap locks instead of
  the kernel lock
 
 - pm_lock (adaptive mutex) for each user pmap; pmap_klock (recursive

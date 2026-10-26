@@ -1,7 +1,7 @@
 From 9a00c1e13e2f11111c8fd57f7b78b5d6ae56e3d1 Mon Sep 17 00:00:00 2001
 From: Romain Dolbeau <romain@dolbeau.org>
 Date: Sun, 25 Oct 2026 15:52:17 +0100
-Subject: [PATCH 10/10] m68k pmap (MULTIPROCESSOR): clear the wired bit
+Subject: [PATCH 10/11] m68k pmap (MULTIPROCESSOR): clear the wired bit
  atomically in pmap_unwire
 
 pmap_unwire() cleared PG_W with a plain read-modify-write of the PTE;

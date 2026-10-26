@@ -1,7 +1,7 @@
 From f0c88d164e1ce4fc15c8bb8843d5f601031ef501 Mon Sep 17 00:00:00 2001
 From: Romain Dolbeau <romain@dolbeau.org>
 Date: Sun, 18 Oct 2026 10:01:10 +0200
-Subject: [PATCH 08/10] m68k pmap (MULTIPROCESSOR): no broadcast shootdowns for
+Subject: [PATCH 08/11] m68k pmap (MULTIPROCESSOR): no broadcast shootdowns for
  user PT pages
 
 - A new PT page is made cache-inhibited directly, with a local flush:

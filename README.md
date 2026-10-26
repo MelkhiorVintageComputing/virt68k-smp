@@ -64,6 +64,8 @@ in order with `git am`.
 8. m68k pmap (MP): no broadcast shootdowns for user PT pages.
 9. m68k pmap (MP): per-pmap locks instead of the kernel lock.
 10. m68k pmap (MP): clear the wired bit atomically in `pmap_unwire`.
+11. m68k atomics: `membar_sync` executes `NOP`, because the 68040 can reorder a write after
+    later reads (TSO-like). See doc/netbsd-mp-design.md.
 
-Patches 1–2 work alone on a uniprocessor kernel. 3–10 add MULTIPROCESSOR; see
+Patches 1–2 work alone on a uniprocessor kernel. 3–11 add MULTIPROCESSOR; see
 doc/netbsd-mp-design.md and doc/pmap-perf.md.
